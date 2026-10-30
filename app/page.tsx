@@ -24,6 +24,7 @@ import {
   SlidersHorizontal,
   ChevronDown,
   ChevronRight,
+  Loader2,
 } from "lucide-react";
 import {
   Card,
@@ -65,8 +66,35 @@ export default function ClearHireDashboard() {
     dataUrl: string;
     mimeType: string;
     fileName: string;
+    fallbackHint?: string;
   } | null>(null);
+  const [isExtractingImage, setIsExtractingImage] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Confirmation modal state when Gemini API fails (do NOT auto-switch to sandbox)
+  const [sandboxConfirmModal, setSandboxConfirmModal] = useState<{
+    open: boolean;
+    errorMessage: string;
+    pendingAction:
+      | {
+          type: "run_agent";
+          overrideMode: "none" | "approve_exception" | "cap_to_band";
+        }
+      | {
+          type: "extract_image";
+          imageObj: {
+            dataUrl: string;
+            mimeType: string;
+            fileName: string;
+            fallbackHint?: string;
+          };
+        }
+      | null;
+  }>({
+    open: false,
+    errorMessage: "",
+    pendingAction: null,
+  });
 
   // Optional browser-side Gemini API key (if not in .env.local) & Model selection
   const [customApiKey, setCustomApiKey] = useState<string>("");
@@ -107,6 +135,73 @@ export default function ClearHireDashboard() {
     return () => clearInterval(interval);
   }, [isLoading]);
 
+  // Extract text from an uploaded or sample image via Gemini Vision
+  const extractImageNotes = async (
+    imageObj: {
+      dataUrl: string;
+      mimeType: string;
+      fileName: string;
+      fallbackHint?: string;
+    },
+    forceSandbox: boolean = false
+  ) => {
+    setIsExtractingImage(true);
+    setErrorMessage(null);
+    if (!forceSandbox) {
+      setPrompt("");
+    }
+
+    try {
+      const response = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "extract_image",
+          imageBase64: imageObj.dataUrl,
+          imageMimeType: imageObj.mimeType,
+          fallbackHint: imageObj.fallbackHint,
+          apiKey: customApiKey || undefined,
+          selectedModel,
+          forceSandbox,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.status === "gemini_error") {
+        setSandboxConfirmModal({
+          open: true,
+          errorMessage:
+            data.errorMessage ||
+            "Failed to communicate with Gemini Vision API.",
+          pendingAction: {
+            type: "extract_image",
+            imageObj,
+          },
+        });
+        return;
+      }
+
+      if (!response.ok || data.error) {
+        throw new Error(
+          data.error || "Failed to extract text from the uploaded image."
+        );
+      }
+
+      setPrompt(data.extractedText || "");
+      setEngineMode(data.engineMode || null);
+      setActiveModelName(data.model || null);
+    } catch (err: unknown) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : "Unexpected error extracting text from image."
+      );
+    } finally {
+      setIsExtractingImage(false);
+    }
+  };
+
   // Handle local image upload for Multimodal Handwritten Note / Resume Analysis (P1)
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -114,31 +209,37 @@ export default function ClearHireDashboard() {
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      setUploadedImage({
+      const newImage = {
         dataUrl: result,
         mimeType: file.type || "image/png",
         fileName: file.name,
-      });
+      };
+      setUploadedImage(newImage);
+      extractImageNotes(newImage, false);
     };
     reader.readAsDataURL(file);
+    e.target.value = "";
   };
 
   // Load 1-Click Sample Handwritten Note Image (P1 Demo Helper)
   const handleGenerateSampleNote = (variant: "compliant" | "violation") => {
     const sample = generateSampleHandwrittenNoteImage(variant);
-    setUploadedImage({
+    const newImage = {
       dataUrl: sample.dataUrl,
       mimeType: sample.mimeType,
       fileName: sample.fileName,
-    });
-    setPrompt(sample.extractedHint);
+      fallbackHint: sample.extractedHint,
+    };
+    setUploadedImage(newImage);
+    extractImageNotes(newImage, false);
   };
 
   // Execute the Autonomous Onboarding Agent API
   const runOnboardingAgent = async (
-    overrideMode: "none" | "approve_exception" | "cap_to_band" = "none"
+    overrideMode: "none" | "approve_exception" | "cap_to_band" = "none",
+    forceSandbox: boolean = false
   ) => {
-    if (!prompt.trim() && !uploadedImage) return;
+    if (!prompt.trim() || isExtractingImage) return;
 
     setIsLoading(true);
     setErrorMessage(null);
@@ -149,16 +250,32 @@ export default function ClearHireDashboard() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          action: "run_agent",
           prompt,
           imageBase64: uploadedImage?.dataUrl,
           imageMimeType: uploadedImage?.mimeType,
           overrideMode,
           apiKey: customApiKey || undefined,
           selectedModel,
+          forceSandbox,
         }),
       });
 
       const data = await response.json();
+
+      if (data.status === "gemini_error") {
+        setStatus("idle");
+        setSandboxConfirmModal({
+          open: true,
+          errorMessage:
+            data.errorMessage || "Failed to communicate with the Gemini API.",
+          pendingAction: {
+            type: "run_agent",
+            overrideMode,
+          },
+        });
+        return;
+      }
 
       if (!response.ok || data.error) {
         throw new Error(data.error || "Failed to execute onboarding agent.");
@@ -187,6 +304,27 @@ export default function ClearHireDashboard() {
       );
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Handle user confirmation to proceed with Deterministic Tool Sandbox
+  const handleConfirmSandbox = () => {
+    const pending = sandboxConfirmModal.pendingAction;
+    setSandboxConfirmModal({ open: false, errorMessage: "", pendingAction: null });
+    if (!pending) return;
+
+    if (pending.type === "extract_image") {
+      extractImageNotes(pending.imageObj, true);
+    } else if (pending.type === "run_agent") {
+      runOnboardingAgent(pending.overrideMode, true);
+    }
+  };
+
+  const handleCancelSandbox = () => {
+    const pending = sandboxConfirmModal.pendingAction;
+    setSandboxConfirmModal({ open: false, errorMessage: "", pendingAction: null });
+    if (pending?.type === "extract_image" && !prompt.trim()) {
+      setUploadedImage(null);
     }
   };
 
@@ -473,33 +611,52 @@ export default function ClearHireDashboard() {
                 )}
               </div>
 
-              {/* Unstructured Hiring Request Textarea (Fixed Size) */}
+              {/* Hiring Request Notes Textarea (Fixed Size + Image Extraction Spinner) */}
               <div className="space-y-2 flex flex-col">
                 <div className="flex items-center justify-between">
                   <label
                     htmlFor="hiring-notes"
                     className="text-[11px] font-semibold uppercase tracking-wider text-slate-300"
                   >
-                    Unstructured Hiring Request Notes
+                    Hiring Request Notes
                   </label>
                   <button
                     type="button"
+                    disabled={isExtractingImage}
                     onClick={() => {
                       setPrompt("");
                       setUploadedImage(null);
                     }}
-                    className="text-[11px] text-slate-400 hover:text-slate-200"
+                    className="text-[11px] text-slate-400 hover:text-slate-200 disabled:opacity-50"
                   >
                     Clear text
                   </button>
                 </div>
-                <Textarea
-                  id="hiring-notes"
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder='e.g., "Hire Sarah for Senior Dev, 20k SAR, starts Nov 1st, wants a Mac..."'
-                  className="h-[155px] resize-none border-slate-800 bg-slate-950/90 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:ring-emerald-500 leading-relaxed"
-                />
+                <div className="relative">
+                  <Textarea
+                    id="hiring-notes"
+                    value={prompt}
+                    disabled={isExtractingImage}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    placeholder={
+                      isExtractingImage
+                        ? "Extracting text from uploaded image via Gemini Vision..."
+                        : 'e.g., "Hire Sarah for Senior Dev, 20k SAR, starts Nov 1st, wants a Mac..."'
+                    }
+                    className="h-[155px] resize-none border-slate-800 bg-slate-950/90 text-sm text-slate-100 placeholder:text-slate-500 focus-visible:ring-emerald-500 leading-relaxed"
+                  />
+                  {isExtractingImage && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-md bg-slate-950/85 backdrop-blur-[2px] border border-sky-500/40 p-4 text-center">
+                      <Loader2 className="h-6 w-6 animate-spin text-sky-400" />
+                      <div className="text-xs font-semibold text-sky-200">
+                        Extracting text from photo with Gemini Vision...
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        Please wait until the extracted notes appear for your review.
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* P1 Feature: Multimodal Input (Handwritten Interview Notes / Resume Image) */}
@@ -591,12 +748,14 @@ export default function ClearHireDashboard() {
                 <Button
                   type="button"
                   size="lg"
-                  disabled={isLoading || (!prompt.trim() && !uploadedImage)}
-                  onClick={() => runOnboardingAgent("none")}
+                  disabled={isLoading || isExtractingImage || !prompt.trim()}
+                  onClick={() => runOnboardingAgent("none", false)}
                   className="flex-1 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold shadow-lg shadow-emerald-600/20"
                 >
                   <Send className="h-4 w-4" />
-                  {isLoading
+                  {isExtractingImage
+                    ? "Waiting for Image Text Extraction..."
+                    : isLoading
                     ? "Executing Autonomous Tool Calls..."
                     : "Run Autonomous Onboarding Agent"}
                 </Button>
@@ -691,7 +850,12 @@ export default function ClearHireDashboard() {
                     type="button"
                     size="sm"
                     disabled={isLoading}
-                    onClick={() => runOnboardingAgent("approve_exception")}
+                    onClick={() =>
+                      runOnboardingAgent(
+                        "approve_exception",
+                        engineMode === "simulated_fallback"
+                      )
+                    }
                     className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs"
                   >
                     <CheckCircle2 className="h-4 w-4" />
@@ -703,7 +867,12 @@ export default function ClearHireDashboard() {
                     variant="outline"
                     size="sm"
                     disabled={isLoading}
-                    onClick={() => runOnboardingAgent("cap_to_band")}
+                    onClick={() =>
+                      runOnboardingAgent(
+                        "cap_to_band",
+                        engineMode === "simulated_fallback"
+                      )
+                    }
                     className="border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 text-xs"
                   >
                     <SlidersHorizontal className="h-4 w-4" />
@@ -994,6 +1163,62 @@ export default function ClearHireDashboard() {
           </Card>
         </div>
       </main>
+
+      {/* =================================================================== */}
+      {/* GEMINI API ERROR -> CONFIRM SWITCH TO TOOL SANDBOX MODAL            */}
+      {/* =================================================================== */}
+      {sandboxConfirmModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <Card className="w-full max-w-md border-amber-500/50 bg-slate-900 shadow-2xl">
+            <CardHeader className="pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-400">
+                  <AlertTriangle className="h-5 w-5" />
+                </div>
+                <div>
+                  <CardTitle className="text-sm sm:text-base text-white">
+                    Gemini API Unavailable — Confirm Fallback
+                  </CardTitle>
+                  <CardDescription className="text-xs text-slate-400">
+                    The system did not automatically switch to the Tool Sandbox.
+                  </CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="rounded-lg border border-amber-500/30 bg-slate-950/90 p-3 text-xs text-amber-200/90 leading-relaxed break-words">
+                {sandboxConfirmModal.errorMessage}
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Would you like to proceed using the{" "}
+                <strong className="text-emerald-400">
+                  Deterministic Tool Sandbox
+                </strong>{" "}
+                instead, or cancel to check your Gemini API Key?
+              </p>
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCancelSandbox}
+                  className="border-slate-700 bg-slate-950 text-slate-300 hover:bg-slate-800 text-xs"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={handleConfirmSandbox}
+                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs"
+                >
+                  Confirm & Proceed with Tool Sandbox
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

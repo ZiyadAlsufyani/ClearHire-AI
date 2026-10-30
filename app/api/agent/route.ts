@@ -264,21 +264,142 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const {
+      action = "run_agent", // "run_agent" | "extract_image"
       prompt = "",
       imageBase64,
       imageMimeType,
+      fallbackHint = "",
       overrideMode = "none", // "none" | "approve_exception" | "cap_to_band"
       apiKey: clientApiKey,
       selectedModel = "auto",
+      forceSandbox = false,
     } = body as {
+      action?: "run_agent" | "extract_image";
       prompt?: string;
       imageBase64?: string;
       imageMimeType?: string;
+      fallbackHint?: string;
       overrideMode?: "none" | "approve_exception" | "cap_to_band";
       apiKey?: string;
       selectedModel?: string;
+      forceSandbox?: boolean;
     };
 
+    const resolvedApiKey =
+      (clientApiKey && clientApiKey.trim()) ||
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      "";
+
+    const defaultFallbackModels = [
+      "gemini-3.8-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-flash-latest",
+      "gemini-2.5-flash",
+    ];
+    const candidateModels =
+      selectedModel && selectedModel !== "auto"
+        ? [
+            selectedModel,
+            ...defaultFallbackModels.filter((m) => m !== selectedModel),
+          ]
+        : defaultFallbackModels;
+
+    // ========================================================================
+    // MODE 1: MULTIMODAL IMAGE-TO-TEXT EXTRACTION (action === "extract_image")
+    // ========================================================================
+    if (action === "extract_image") {
+      if (!imageBase64) {
+        return NextResponse.json(
+          { error: "No image provided for text extraction." },
+          { status: 400 }
+        );
+      }
+
+      if (!forceSandbox) {
+        if (!resolvedApiKey) {
+          return NextResponse.json({
+            status: "gemini_error",
+            geminiError: true,
+            errorMessage:
+              "No Gemini API Key is configured to extract text from this image with Gemini Vision. Would you like to proceed using the Tool Sandbox fallback?",
+          });
+        }
+
+        try {
+          const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
+          let visionResponse = null;
+          let lastErr: unknown = null;
+          let usedModel = candidateModels[0];
+
+          for (const modelName of candidateModels) {
+            try {
+              usedModel = modelName;
+              visionResponse = await ai.models.generateContent({
+                model: modelName,
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        inlineData: {
+                          data: imageBase64.replace(/^data:[^;]+;base64,/, ""),
+                          mimeType: imageMimeType || "image/png",
+                        },
+                      },
+                      {
+                        text: "Transcribe and extract the hiring request details from this handwritten interview note or resume image into a clear, editable hiring request note. Include Candidate Name, Target Role, Monthly Salary (in SAR if present), Start Date, Leave/PTO/Work Arrangement, and IT Hardware requests. Return ONLY the plain text hiring request notes without markdown code fences.",
+                      },
+                    ],
+                  },
+                ],
+                config: {
+                  temperature: 0.1,
+                },
+              });
+              break;
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+
+          if (!visionResponse || !visionResponse.text) {
+            throw lastErr || new Error("Gemini Vision returned an empty response.");
+          }
+
+          return NextResponse.json({
+            status: "extracted",
+            extractedText: visionResponse.text.trim(),
+            engineMode: "gemini_live",
+            model: usedModel,
+          });
+        } catch (err: unknown) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "Gemini Vision failed to extract text from the uploaded image.";
+          return NextResponse.json({
+            status: "gemini_error",
+            geminiError: true,
+            errorMessage: `Gemini Vision API Error: ${msg}`,
+          });
+        }
+      }
+
+      // User confirmed Tool Sandbox fallback for image extraction
+      return NextResponse.json({
+        status: "extracted",
+        extractedText:
+          fallbackHint ||
+          "Hire Tariq Al-Dosari for Senior Software Engineer, 23,500 SAR/month, starts November 15, 2026. Standard 21 days PTO, hybrid in Riyadh. Wants 16-inch MacBook Pro M3 Max and 4K Monitor.",
+        engineMode: "simulated_fallback",
+        model: "deterministic-tool-engine",
+      });
+    }
+
+    // ========================================================================
+    // MODE 2: MAIN AUTONOMOUS ONBOARDING AGENT (action === "run_agent")
+    // ========================================================================
     if (!prompt.trim() && !imageBase64) {
       return NextResponse.json(
         { error: "Please provide hiring request notes or upload an interview note image." },
@@ -289,12 +410,6 @@ export async function POST(req: NextRequest) {
     const steps: AgentStepLog[] = [];
     const nowIso = () => new Date().toISOString();
 
-    const resolvedApiKey =
-      (clientApiKey && clientApiKey.trim()) ||
-      process.env.GEMINI_API_KEY ||
-      process.env.GOOGLE_API_KEY ||
-      "";
-
     const heuristicCandidate = extractCandidateHeuristic(
       prompt ||
         (imageBase64
@@ -302,29 +417,22 @@ export async function POST(req: NextRequest) {
           : "")
     );
 
-    // If no image is uploaded and the user is running in deterministic mode (or gave text without name/role),
-    // enforce that at least Candidate Name and Target Role are present when no Gemini key is active.
-    if (
-      !imageBase64 &&
-      !resolvedApiKey &&
-      (!heuristicCandidate.hasExplicitName || !heuristicCandidate.hasExplicitRole)
-    ) {
-      return NextResponse.json(
-        {
-          error:
-            "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary will automatically default to the role's maximum band cap.",
-        },
-        { status: 400 }
-      );
+    // If user hasn't confirmed Tool Sandbox and no API key is configured, ask confirmation first!
+    if (!forceSandbox && !resolvedApiKey) {
+      return NextResponse.json({
+        status: "gemini_error",
+        geminiError: true,
+        errorMessage:
+          "No Gemini API Key is configured. Would you like to proceed using the Deterministic Tool Sandbox instead?",
+      });
     }
 
     let policyResult: PolicyVerificationResult | null = null;
     let offerLetterMarkdown: string | null = null;
     let itTicketPayload: ItTicketPayload | null = null;
     let agentSummary = "";
-    let engineMode: "gemini_live" | "simulated_fallback" = resolvedApiKey
-      ? "gemini_live"
-      : "simulated_fallback";
+    let engineMode: "gemini_live" | "simulated_fallback" =
+      resolvedApiKey && !forceSandbox ? "gemini_live" : "simulated_fallback";
     let usedModelName =
       selectedModel && selectedModel !== "auto" ? selectedModel : "gemini-3.8-flash";
 
@@ -334,7 +442,7 @@ export async function POST(req: NextRequest) {
       phase: "parse",
       title: imageBase64
         ? "Multimodal Vision + Text Parsing"
-        : "Analyzing Unstructured Hiring Request",
+        : "Analyzing Hiring Request Notes",
       detail: imageBase64
         ? "Extracting candidate entities, compensation, and hardware needs from uploaded image and notes..."
         : "Tokenizing recruiter notes to extract candidate name, target role, SAR compensation, start date, and hardware requests.",
@@ -345,22 +453,9 @@ export async function POST(req: NextRequest) {
     // ========================================================================
     // LIVE GEMINI FUNCTION-CALLING PIPELINE (@google/genai)
     // ========================================================================
-    if (resolvedApiKey) {
+    if (resolvedApiKey && !forceSandbox) {
       try {
         const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
-        const defaultFallbackModels = [
-          "gemini-3.8-flash",
-          "gemini-3.5-flash-lite",
-          "gemini-flash-latest",
-          "gemini-2.5-flash",
-        ];
-        const candidateModels =
-          selectedModel && selectedModel !== "auto"
-            ? [
-                selectedModel,
-                ...defaultFallbackModels.filter((m) => m !== selectedModel),
-              ]
-            : defaultFallbackModels;
 
         const userParts: Part[] = [];
         if (imageBase64 && imageMimeType) {
@@ -853,9 +948,17 @@ export async function POST(req: NextRequest) {
           steps,
           agentSummary,
         });
-      } catch (geminiError) {
-        console.warn("Gemini API call failed, falling back to deterministic tool execution:", geminiError);
-        engineMode = "simulated_fallback";
+      } catch (geminiError: unknown) {
+        console.warn("Gemini API call failed:", geminiError);
+        const errMsg =
+          geminiError instanceof Error
+            ? geminiError.message
+            : "Failed to communicate with the Gemini API.";
+        return NextResponse.json({
+          status: "gemini_error",
+          geminiError: true,
+          errorMessage: `Gemini API Error: ${errMsg}`,
+        });
       }
     }
 
