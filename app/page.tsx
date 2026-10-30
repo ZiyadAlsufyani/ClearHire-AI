@@ -68,8 +68,10 @@ export default function ClearHireDashboard() {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Optional browser-side Gemini API key (if not in .env.local)
+  // Optional browser-side Gemini API key (if not in .env.local) & Model selection
   const [customApiKey, setCustomApiKey] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<string>("auto");
+  const [activeModelName, setActiveModelName] = useState<string | null>(null);
   const [showApiKeyModal, setShowApiKeyModal] = useState<boolean>(false);
   const [showPolicyModal, setShowPolicyModal] = useState<boolean>(false);
   const [showScenarios, setShowScenarios] = useState<boolean>(false);
@@ -152,6 +154,7 @@ export default function ClearHireDashboard() {
           imageMimeType: uploadedImage?.mimeType,
           overrideMode,
           apiKey: customApiKey || undefined,
+          selectedModel,
         }),
       });
 
@@ -168,6 +171,7 @@ export default function ClearHireDashboard() {
       setItTicket(data.itTicket || null);
       setAgentSummary(data.agentSummary || "");
       setEngineMode(data.engineMode || null);
+      setActiveModelName(data.model || null);
 
       if (data.status === "awaiting_override") {
         setStatus("awaiting_override");
@@ -256,7 +260,7 @@ export default function ClearHireDashboard() {
               >
                 <Sparkles className="h-3 w-3 text-sky-400" />
                 {engineMode === "gemini_live"
-                  ? "Live @google/genai Tool Calling"
+                  ? `Live @google/genai (${activeModelName || "gemini-3.8-flash"})`
                   : "Deterministic Tool Sandbox"}
               </Badge>
             )}
@@ -281,30 +285,41 @@ export default function ClearHireDashboard() {
             >
               <KeyRound className="h-3.5 w-3.5 text-amber-400" />
               <span className="hidden sm:inline">
-                {customApiKey ? "API Key Active" : "Gemini API Key"}
+                {customApiKey ? "API Key & Model" : "Gemini API Key"}
               </span>
             </Button>
           </div>
         </div>
 
-        {/* Collapsible API Key Bar */}
+        {/* Collapsible API Key & Model Selector Bar */}
         {showApiKeyModal && (
           <div className="border-t border-slate-800 bg-slate-900/95 px-4 py-3 sm:px-6">
-            <div className="mx-auto flex max-w-[1600px] flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="mx-auto flex max-w-[1600px] flex-col lg:flex-row items-start lg:items-center justify-between gap-3">
               <div className="text-xs text-slate-300">
                 <strong className="text-white">
-                  Configure Google Gemini API Key (<code>@google/genai</code>):
+                  Configure Google Gemini API Key & Model (<code>@google/genai</code>):
                 </strong>{" "}
-                Uses <code>process.env.GEMINI_API_KEY</code> by default, or you
-                can paste a key below for immediate live tool-calling inference.
+                Uses <code>process.env.GEMINI_API_KEY</code> by default, or paste a key and choose a specific Gemini model below.
               </div>
-              <div className="flex w-full sm:w-auto items-center gap-2">
+              <div className="flex flex-wrap w-full lg:w-auto items-center gap-2">
+                <select
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                  <option value="auto">Auto Fallback (Recommended — gemini-3.8-flash)</option>
+                  <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+                  <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                  <option value="gemini-flash-latest">gemini-flash-latest</option>
+                  <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                  <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                </select>
                 <input
                   type="password"
                   value={customApiKey}
                   onChange={(e) => setCustomApiKey(e.target.value)}
                   placeholder="AIzaSy... (Optional if set in .env.local)"
-                  className="w-full sm:w-80 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="w-full sm:w-72 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
                 <Button
                   type="button"

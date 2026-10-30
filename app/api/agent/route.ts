@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI, Type, FunctionDeclaration, Part } from "@google/genai";
+import {
+  GoogleGenAI,
+  Type,
+  FunctionDeclaration,
+  FunctionCallingConfigMode,
+  Part,
+} from "@google/genai";
 import {
   COMPANY_POLICY_SYSTEM_PROMPT,
   evaluateHrPolicy,
@@ -19,7 +25,7 @@ import {
 const verifyHrPolicyDeclaration: FunctionDeclaration = {
   name: "verify_hr_policy",
   description:
-    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy.",
+    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy. Also accepts candidate_name, start_date, and hardware_requests if extracted from the notes or image.",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -36,6 +42,19 @@ const verifyHrPolicyDeclaration: FunctionDeclaration = {
         items: { type: Type.STRING },
         description:
           "List of any special or custom requests mentioned in the notes (e.g., '30 days PTO', '100% fully remote', '20k signing bonus'). Pass an empty array if none.",
+      },
+      candidate_name: {
+        type: Type.STRING,
+        description: "Optional full name of the candidate extracted from the notes or image.",
+      },
+      start_date: {
+        type: Type.STRING,
+        description: "Optional start date extracted from the notes or image.",
+      },
+      hardware_requests: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description: "Optional list of hardware items requested by the candidate.",
       },
     },
     required: ["role", "salary", "custom_requests"],
@@ -103,34 +122,47 @@ const AGENT_TOOLS = [
 ];
 
 // ============================================================================
-// DETERMINISTIC ENTITY PARSER (Used for Fallback or Pre-normalization)
+// DETERMINISTIC ENTITY PARSER & SMART DEFAULTS ENGINE
 // ============================================================================
-function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
+interface HeuristicParseResult extends ExtractedCandidate {
+  hasExplicitName: boolean;
+  hasExplicitRole: boolean;
+  hasExplicitSalary: boolean;
+}
+
+function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
   const text = rawNotes.trim();
 
-  // Extract candidate name
-  let candidateName = "Sarah Al-Mansoor";
+  // 1. Extract candidate name
+  let candidateName = "";
+  let hasExplicitName = false;
   const namePatterns = [
-    /(?:hire|onboard|candidate|offer\s+for|for|name\s*[:=-])\s+(?:dr\.?\s+)?([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,2})/i,
-    /^([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)?)\s*[—–-]/m,
+    /(?:hire|onboard|candidate|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,2})/i,
+    /^([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)?)\s*(?:[—–,-]|\bfor\b|\bas\b)/m,
   ];
   for (const pattern of namePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
       const cleaned = match[1]
-        .replace(/\b(for|as|at|in|on|starts|starting|urgent|hire)\b.*$/i, "")
+        .replace(
+          /\b(for|as|at|in|on|starts|starting|urgent|hire|senior|junior|developer|engineer|designer|manager)\b.*$/i,
+          ""
+        )
         .trim();
       if (cleaned.length >= 2) {
         candidateName = cleaned;
+        hasExplicitName = true;
         break;
       }
     }
   }
 
-  // Extract role
-  let role = "Senior Software Engineer";
+  // 2. Extract role
+  let role = "";
+  let hasExplicitRole = false;
   const rolePatterns = [
-    /(?:for|as|role\s*[:=-]|position\s*[:=-])\s+([A-Za-z0-9\s/+-]+?)(?:,|\.|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|\n|$)/i,
+    /(?:for|as|role\s*[:=-]|position\s*[:=-]|title\s*[:=-])\s+([A-Za-z0-9\s/+-]+?)(?:,|\.|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|\n|$)/i,
+    /\b((?:senior|junior|jr|sr|staff|principal|lead|mid|ai|ml|product|ux|ui|software|fullstack|frontend|backend)\s+(?:dev|developer|software\s+engineer|ai\s+engineer|ml\s+engineer|engineer|designer|product\s+designer|product\s+manager|manager|architect))\b/i,
   ];
   for (const pattern of rolePatterns) {
     const match = text.match(pattern);
@@ -138,23 +170,31 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
       const candidateRole = match[1].trim();
       if (candidateRole.length >= 2 && candidateRole.length <= 45) {
         role = candidateRole;
+        hasExplicitRole = true;
         break;
       }
     }
   }
 
-  // Extract salary in SAR
-  let salary = 20000;
+  const matchedBand = matchRoleBand(role || "Senior Software Engineer");
+
+  // 3. Extract salary in SAR (Default to HIGHEST salary cap for the role if omitted!)
+  let salary = matchedBand.maxSalarySAR;
+  let hasExplicitSalary = false;
   const kMatch = text.match(/(\d+(?:\.\d+)?)\s*k\s*(?:sar)?/i);
-  const fullNumMatch = text.match(/(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i);
+  const fullNumMatch = text.match(
+    /(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i
+  );
   if (kMatch) {
     salary = Math.round(parseFloat(kMatch[1]) * 1000);
+    hasExplicitSalary = true;
   } else if (fullNumMatch) {
     salary = parseInt(fullNumMatch[1].replace(/,/g, ""), 10);
+    hasExplicitSalary = true;
   }
 
-  // Extract start date
-  let startDate = "November 1, 2026";
+  // 4. Extract start date (Default to standard 2-week onboarding lead time if omitted)
+  let startDate = "November 15, 2026";
   const dateMatch = text.match(
     /(?:starts?|starting|commencing|from|date\s*[:=-])\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i
   );
@@ -162,7 +202,7 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     startDate = dateMatch[1].trim();
   }
 
-  // Extract custom requests
+  // 5. Extract custom requests (Default to empty -> standard 21d PTO & Hybrid schedule)
   const customRequests: string[] = [];
   const ptoMatch = text.match(/(\d+\s*days?\s*(?:pto|leave|vacation|holiday))/i);
   if (ptoMatch) customRequests.push(ptoMatch[1]);
@@ -175,7 +215,7 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
   const bonusMatch = text.match(/(\d+\s*k?\s*(?:sar\s*)?(?:signing|sign-on)\s*bonus)/i);
   if (bonusMatch) customRequests.push(bonusMatch[1]);
 
-  // Extract hardware requests
+  // 6. Extract hardware requests (Default to role's standard workstation bundle if omitted)
   const hardwareRequests: string[] = [];
   if (/macbook\s*pro|mbp|m3\s*max|16-inch\s*mac/i.test(text)) {
     hardwareRequests.push('Apple MacBook Pro 16" (M3 Max)');
@@ -195,7 +235,12 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     hardwareRequests.push("Dedicated Cloud H100 GPU Node Quota");
   }
   if (hardwareRequests.length === 0) {
-    hardwareRequests.push("Standard Role Workstation Bundle");
+    hardwareRequests.push(
+      matchedBand.hardwareTier === "BUSINESS_STANDARD"
+        ? 'Apple MacBook Air 15" (M3)'
+        : 'Apple MacBook Pro 16" (M3 Max)',
+      'Dell UltraSharp 27" 4K USB-C Hub Monitor'
+    );
   }
 
   return {
@@ -205,6 +250,9 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     start_date: startDate,
     custom_requests: customRequests,
     hardware_requests: hardwareRequests,
+    hasExplicitName,
+    hasExplicitRole,
+    hasExplicitSalary,
   };
 }
 
@@ -221,12 +269,14 @@ export async function POST(req: NextRequest) {
       imageMimeType,
       overrideMode = "none", // "none" | "approve_exception" | "cap_to_band"
       apiKey: clientApiKey,
+      selectedModel = "auto",
     } = body as {
       prompt?: string;
       imageBase64?: string;
       imageMimeType?: string;
       overrideMode?: "none" | "approve_exception" | "cap_to_band";
       apiKey?: string;
+      selectedModel?: string;
     };
 
     if (!prompt.trim() && !imageBase64) {
@@ -246,8 +296,27 @@ export async function POST(req: NextRequest) {
       "";
 
     const heuristicCandidate = extractCandidateHeuristic(
-      prompt || "Hire Nadia Al-Zahrani for Senior Product Designer, 21k SAR, starts Nov 10, 2026, wants MacBook Pro and 4K monitor."
+      prompt ||
+        (imageBase64
+          ? "Hire Tariq Al-Dosari for Senior Software Engineer, 23,500 SAR/month, starts November 15, 2026."
+          : "")
     );
+
+    // If no image is uploaded and the user is running in deterministic mode (or gave text without name/role),
+    // enforce that at least Candidate Name and Target Role are present when no Gemini key is active.
+    if (
+      !imageBase64 &&
+      !resolvedApiKey &&
+      (!heuristicCandidate.hasExplicitName || !heuristicCandidate.hasExplicitRole)
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary will automatically default to the role's maximum band cap.",
+        },
+        { status: 400 }
+      );
+    }
 
     let policyResult: PolicyVerificationResult | null = null;
     let offerLetterMarkdown: string | null = null;
@@ -256,7 +325,8 @@ export async function POST(req: NextRequest) {
     let engineMode: "gemini_live" | "simulated_fallback" = resolvedApiKey
       ? "gemini_live"
       : "simulated_fallback";
-    let usedModelName = "gemini-2.5-flash";
+    let usedModelName =
+      selectedModel && selectedModel !== "auto" ? selectedModel : "gemini-3.8-flash";
 
     // Step 1: Parsing input
     steps.push({
@@ -278,7 +348,19 @@ export async function POST(req: NextRequest) {
     if (resolvedApiKey) {
       try {
         const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
-        const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+        const defaultFallbackModels = [
+          "gemini-3.8-flash",
+          "gemini-3.5-flash-lite",
+          "gemini-flash-latest",
+          "gemini-2.5-flash",
+        ];
+        const candidateModels =
+          selectedModel && selectedModel !== "auto"
+            ? [
+                selectedModel,
+                ...defaultFallbackModels.filter((m) => m !== selectedModel),
+              ]
+            : defaultFallbackModels;
 
         const userParts: Part[] = [];
         if (imageBase64 && imageMimeType) {
@@ -319,6 +401,11 @@ export async function POST(req: NextRequest) {
               config: {
                 systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
                 tools: AGENT_TOOLS,
+                toolConfig: {
+                  functionCallingConfig: {
+                    mode: FunctionCallingConfigMode.ANY,
+                  },
+                },
                 temperature: 0.1,
               },
             });
@@ -355,8 +442,49 @@ export async function POST(req: NextRequest) {
             const args = (fnCall.args || {}) as Record<string, unknown>;
 
             if (fnName === "verify_hr_policy") {
-              const roleArg = String(args.role || heuristicCandidate.role);
-              let salaryArg = Number(args.salary || heuristicCandidate.salary);
+              if (
+                args.candidate_name &&
+                String(args.candidate_name).toUpperCase() !== "MISSING"
+              ) {
+                heuristicCandidate.candidate_name = String(args.candidate_name);
+              }
+              if (args.start_date) {
+                heuristicCandidate.start_date = String(args.start_date);
+              }
+              if (
+                Array.isArray(args.hardware_requests) &&
+                args.hardware_requests.length > 0
+              ) {
+                heuristicCandidate.hardware_requests =
+                  args.hardware_requests.map(String);
+              }
+
+              const rawRoleArg = String(args.role || heuristicCandidate.role || "").trim();
+              if (
+                !rawRoleArg ||
+                rawRoleArg.toUpperCase() === "MISSING" ||
+                !heuristicCandidate.candidate_name ||
+                heuristicCandidate.candidate_name.toUpperCase() === "MISSING"
+              ) {
+                return NextResponse.json(
+                  {
+                    error:
+                      "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary, start date, PTO, or hardware will automatically default to the role's policy standards.",
+                  },
+                  { status: 400 }
+                );
+              }
+
+              const roleArg = rawRoleArg;
+              const matchedBand = matchRoleBand(roleArg);
+
+              // Default to highest salary range (matchedBand.maxSalarySAR) if salary was omitted
+              let salaryArg = Number(args.salary || 0);
+              if (!salaryArg || isNaN(salaryArg)) {
+                salaryArg = heuristicCandidate.hasExplicitSalary
+                  ? heuristicCandidate.salary
+                  : matchedBand.maxSalarySAR;
+              }
               if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
 
               let customReqArg = Array.isArray(args.custom_requests)
@@ -364,7 +492,6 @@ export async function POST(req: NextRequest) {
                 : heuristicCandidate.custom_requests;
 
               // If user selected "cap_to_band", clamp salary & custom requests to policy limits
-              const matchedBand = matchRoleBand(roleArg);
               if (overrideMode === "cap_to_band") {
                 if (salaryArg > matchedBand.maxSalarySAR) {
                   salaryArg = matchedBand.maxSalarySAR;
@@ -426,6 +553,7 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "verify_hr_policy",
                   response: {
                     is_approved: effectiveApproved,
@@ -488,6 +616,7 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "generate_offer_letter",
                   response: {
                     status: "success",
@@ -528,6 +657,7 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "create_it_ticket",
                   response: {
                     status: "success",
@@ -554,6 +684,11 @@ export async function POST(req: NextRequest) {
               config: {
                 systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
                 tools: AGENT_TOOLS,
+                toolConfig: {
+                  functionCallingConfig: {
+                    mode: FunctionCallingConfigMode.AUTO,
+                  },
+                },
                 temperature: 0.1,
               },
             });
@@ -725,9 +860,22 @@ export async function POST(req: NextRequest) {
     }
 
     // ========================================================================
-    // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set)
+    // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set or fallback)
     // ========================================================================
+    if (!heuristicCandidate.candidate_name || !heuristicCandidate.role) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary, start date, PTO, or hardware will automatically default to the role's policy standards.",
+        },
+        { status: 400 }
+      );
+    }
+
     const matchedBand = matchRoleBand(heuristicCandidate.role);
+    if (!heuristicCandidate.hasExplicitSalary) {
+      heuristicCandidate.salary = matchedBand.maxSalarySAR;
+    }
     if (overrideMode === "cap_to_band") {
       if (heuristicCandidate.salary > matchedBand.maxSalarySAR) {
         heuristicCandidate.salary = matchedBand.maxSalarySAR;
