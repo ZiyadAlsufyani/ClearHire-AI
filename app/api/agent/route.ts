@@ -1,0 +1,881 @@
+import { NextRequest, NextResponse } from "next/server";
+import { GoogleGenAI, Type, FunctionDeclaration, Part } from "@google/genai";
+import {
+  COMPANY_POLICY_SYSTEM_PROMPT,
+  evaluateHrPolicy,
+  buildOfferLetterMarkdown,
+  buildItTicketPayload,
+  matchRoleBand,
+  PolicyVerificationResult,
+  ItTicketPayload,
+  AgentStepLog,
+  ExtractedCandidate,
+} from "@/lib/policies";
+
+// ============================================================================
+// EXPLICIT GEMINI FUNCTION DECLARATIONS (@google/genai)
+// ============================================================================
+
+const verifyHrPolicyDeclaration: FunctionDeclaration = {
+  name: "verify_hr_policy",
+  description:
+    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      role: {
+        type: Type.STRING,
+        description: "The job title or role being hired for (e.g., 'Senior Dev', 'Senior AI Engineer').",
+      },
+      salary: {
+        type: Type.NUMBER,
+        description: "The proposed monthly salary in SAR as a number (e.g., 20000 for 20k SAR).",
+      },
+      custom_requests: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description:
+          "List of any special or custom requests mentioned in the notes (e.g., '30 days PTO', '100% fully remote', '20k signing bonus'). Pass an empty array if none.",
+      },
+    },
+    required: ["role", "salary", "custom_requests"],
+  },
+};
+
+const generateOfferLetterDeclaration: FunctionDeclaration = {
+  name: "generate_offer_letter",
+  description:
+    "Generates a formal, legally structured Markdown employment contract / Offer Letter for the candidate once HR policy verification is approved.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      candidate_name: {
+        type: Type.STRING,
+        description: "Full name or first name of the candidate being hired.",
+      },
+      role: {
+        type: Type.STRING,
+        description: "Official job title for the employment contract.",
+      },
+      salary: {
+        type: Type.NUMBER,
+        description: "Approved monthly total salary in SAR (e.g., 20000).",
+      },
+      start_date: {
+        type: Type.STRING,
+        description: "Scheduled employment start date (e.g., 'November 1, 2026').",
+      },
+    },
+    required: ["candidate_name", "role", "salary", "start_date"],
+  },
+};
+
+const createItTicketDeclaration: FunctionDeclaration = {
+  name: "create_it_ticket",
+  description:
+    "Creates a structured JSON IT Provisioning & Zero-Trust IAM ticket for the candidate's hardware and software access based on their role and hardware requests.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      role: {
+        type: Type.STRING,
+        description: "The candidate's job role to determine security clearance and base hardware tier.",
+      },
+      hardware_requests: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description:
+          "Array of requested hardware items, laptops, monitors, or peripherals (e.g., ['16-inch MacBook Pro M3 Max', '4K Display']).",
+      },
+    },
+    required: ["role", "hardware_requests"],
+  },
+};
+
+const AGENT_TOOLS = [
+  {
+    functionDeclarations: [
+      verifyHrPolicyDeclaration,
+      generateOfferLetterDeclaration,
+      createItTicketDeclaration,
+    ],
+  },
+];
+
+// ============================================================================
+// DETERMINISTIC ENTITY PARSER (Used for Fallback or Pre-normalization)
+// ============================================================================
+function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
+  const text = rawNotes.trim();
+
+  // Extract candidate name
+  let candidateName = "Sarah Al-Mansoor";
+  const namePatterns = [
+    /(?:hire|onboard|candidate|offer\s+for|for|name\s*[:=-])\s+(?:dr\.?\s+)?([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,2})/i,
+    /^([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)?)\s*[—–-]/m,
+  ];
+  for (const pattern of namePatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const cleaned = match[1]
+        .replace(/\b(for|as|at|in|on|starts|starting|urgent|hire)\b.*$/i, "")
+        .trim();
+      if (cleaned.length >= 2) {
+        candidateName = cleaned;
+        break;
+      }
+    }
+  }
+
+  // Extract role
+  let role = "Senior Software Engineer";
+  const rolePatterns = [
+    /(?:for|as|role\s*[:=-]|position\s*[:=-])\s+([A-Za-z0-9\s/+-]+?)(?:,|\.|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|\n|$)/i,
+  ];
+  for (const pattern of rolePatterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const candidateRole = match[1].trim();
+      if (candidateRole.length >= 2 && candidateRole.length <= 45) {
+        role = candidateRole;
+        break;
+      }
+    }
+  }
+
+  // Extract salary in SAR
+  let salary = 20000;
+  const kMatch = text.match(/(\d+(?:\.\d+)?)\s*k\s*(?:sar)?/i);
+  const fullNumMatch = text.match(/(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i);
+  if (kMatch) {
+    salary = Math.round(parseFloat(kMatch[1]) * 1000);
+  } else if (fullNumMatch) {
+    salary = parseInt(fullNumMatch[1].replace(/,/g, ""), 10);
+  }
+
+  // Extract start date
+  let startDate = "November 1, 2026";
+  const dateMatch = text.match(
+    /(?:starts?|starting|commencing|from|date\s*[:=-])\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i
+  );
+  if (dateMatch && dateMatch[1]) {
+    startDate = dateMatch[1].trim();
+  }
+
+  // Extract custom requests
+  const customRequests: string[] = [];
+  const ptoMatch = text.match(/(\d+\s*days?\s*(?:pto|leave|vacation|holiday))/i);
+  if (ptoMatch) customRequests.push(ptoMatch[1]);
+  if (/100%\s*(?:fully\s*)?remote|fully\s*remote|work\s*from\s*abroad/i.test(text)) {
+    customRequests.push("100% Fully Remote Work Arrangement");
+  }
+  if (/4-day|4\s+day\s+work/i.test(text)) {
+    customRequests.push("4-day workweek schedule");
+  }
+  const bonusMatch = text.match(/(\d+\s*k?\s*(?:sar\s*)?(?:signing|sign-on)\s*bonus)/i);
+  if (bonusMatch) customRequests.push(bonusMatch[1]);
+
+  // Extract hardware requests
+  const hardwareRequests: string[] = [];
+  if (/macbook\s*pro|mbp|m3\s*max|16-inch\s*mac/i.test(text)) {
+    hardwareRequests.push('Apple MacBook Pro 16" (M3 Max)');
+  } else if (/macbook|mac/i.test(text)) {
+    hardwareRequests.push("Apple MacBook Pro");
+  }
+  if (/dell|xps|linux|ubuntu/i.test(text)) {
+    hardwareRequests.push("Dell XPS 16 Developer Edition");
+  }
+  if (/dual\s*4k|two\s*monitors|dual\s*displays|4k\s*monitor|4k\s*display/i.test(text)) {
+    hardwareRequests.push("Dual 27-inch 4K UltraSharp Displays");
+  }
+  if (/mouse|ergonomic/i.test(text)) {
+    hardwareRequests.push("Logitech MX Vertical Ergonomic Mouse");
+  }
+  if (/gpu\s*cluster|h100/i.test(text)) {
+    hardwareRequests.push("Dedicated Cloud H100 GPU Node Quota");
+  }
+  if (hardwareRequests.length === 0) {
+    hardwareRequests.push("Standard Role Workstation Bundle");
+  }
+
+  return {
+    candidate_name: candidateName,
+    role,
+    salary,
+    start_date: startDate,
+    custom_requests: customRequests,
+    hardware_requests: hardwareRequests,
+  };
+}
+
+// ============================================================================
+// MAIN POST ROUTE HANDLER
+// ============================================================================
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const {
+      prompt = "",
+      imageBase64,
+      imageMimeType,
+      overrideMode = "none", // "none" | "approve_exception" | "cap_to_band"
+      apiKey: clientApiKey,
+    } = body as {
+      prompt?: string;
+      imageBase64?: string;
+      imageMimeType?: string;
+      overrideMode?: "none" | "approve_exception" | "cap_to_band";
+      apiKey?: string;
+    };
+
+    if (!prompt.trim() && !imageBase64) {
+      return NextResponse.json(
+        { error: "Please provide hiring request notes or upload an interview note image." },
+        { status: 400 }
+      );
+    }
+
+    const steps: AgentStepLog[] = [];
+    const nowIso = () => new Date().toISOString();
+
+    const resolvedApiKey =
+      (clientApiKey && clientApiKey.trim()) ||
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      "";
+
+    const heuristicCandidate = extractCandidateHeuristic(
+      prompt || "Hire Nadia Al-Zahrani for Senior Product Designer, 21k SAR, starts Nov 10, 2026, wants MacBook Pro and 4K monitor."
+    );
+
+    let policyResult: PolicyVerificationResult | null = null;
+    let offerLetterMarkdown: string | null = null;
+    let itTicketPayload: ItTicketPayload | null = null;
+    let agentSummary = "";
+    let engineMode: "gemini_live" | "simulated_fallback" = resolvedApiKey
+      ? "gemini_live"
+      : "simulated_fallback";
+    let usedModelName = "gemini-2.5-flash";
+
+    // Step 1: Parsing input
+    steps.push({
+      id: "step-parse",
+      phase: "parse",
+      title: imageBase64
+        ? "Multimodal Vision + Text Parsing"
+        : "Analyzing Unstructured Hiring Request",
+      detail: imageBase64
+        ? "Extracting candidate entities, compensation, and hardware needs from uploaded image and notes..."
+        : "Tokenizing recruiter notes to extract candidate name, target role, SAR compensation, start date, and hardware requests.",
+      status: "completed",
+      timestamp: nowIso(),
+    });
+
+    // ========================================================================
+    // LIVE GEMINI FUNCTION-CALLING PIPELINE (@google/genai)
+    // ========================================================================
+    if (resolvedApiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
+        const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+
+        const userParts: Part[] = [];
+        if (imageBase64 && imageMimeType) {
+          userParts.push({
+            inlineData: {
+              data: imageBase64.replace(/^data:[^;]+;base64,/, ""),
+              mimeType: imageMimeType,
+            },
+          });
+        }
+
+        const overrideInstruction =
+          overrideMode === "approve_exception"
+            ? "\n\n[SYSTEM GOVERNANCE UPDATE: Human-in-the-Loop Executive Override has APPROVED all policy exceptions for this candidate. After calling verify_hr_policy, you MUST proceed to call generate_offer_letter and create_it_ticket immediately.]"
+            : overrideMode === "cap_to_band"
+            ? "\n\n[SYSTEM GOVERNANCE UPDATE: Recruiter chose to AUTO-ADJUST the offer to comply with the maximum allowed salary cap and standard 21-day PTO for this role. Call verify_hr_policy, generate_offer_letter, and create_it_ticket using the capped policy-compliant salary.]"
+            : "";
+
+        userParts.push({
+          text: `${
+            prompt.trim() ||
+            "Extract the hiring request details from this handwritten interview note image and onboard the candidate."
+          }${overrideInstruction}`,
+        });
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const contents: any[] = [{ role: "user", parts: userParts }];
+
+        let response = null;
+        let lastModelError: unknown = null;
+
+        for (const modelName of candidateModels) {
+          try {
+            usedModelName = modelName;
+            response = await ai.models.generateContent({
+              model: modelName,
+              contents,
+              config: {
+                systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
+                tools: AGENT_TOOLS,
+                temperature: 0.1,
+              },
+            });
+            break;
+          } catch (err) {
+            lastModelError = err;
+          }
+        }
+
+        if (!response) {
+          throw lastModelError || new Error("Failed to invoke Gemini model.");
+        }
+
+        // Multi-turn tool execution loop (up to 5 turns)
+        let turnCount = 0;
+        let haltedForHitl = false;
+
+        while (
+          response.functionCalls &&
+          response.functionCalls.length > 0 &&
+          turnCount < 5 &&
+          !haltedForHitl
+        ) {
+          turnCount++;
+          const modelCandidateContent = response.candidates?.[0]?.content;
+          if (modelCandidateContent) {
+            contents.push(modelCandidateContent);
+          }
+
+          const toolResponseParts: Part[] = [];
+
+          for (const fnCall of response.functionCalls) {
+            const fnName = fnCall.name || "";
+            const args = (fnCall.args || {}) as Record<string, unknown>;
+
+            if (fnName === "verify_hr_policy") {
+              const roleArg = String(args.role || heuristicCandidate.role);
+              let salaryArg = Number(args.salary || heuristicCandidate.salary);
+              if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
+
+              let customReqArg = Array.isArray(args.custom_requests)
+                ? args.custom_requests.map(String)
+                : heuristicCandidate.custom_requests;
+
+              // If user selected "cap_to_band", clamp salary & custom requests to policy limits
+              const matchedBand = matchRoleBand(roleArg);
+              if (overrideMode === "cap_to_band") {
+                if (salaryArg > matchedBand.maxSalarySAR) {
+                  salaryArg = matchedBand.maxSalarySAR;
+                }
+                customReqArg = [];
+              }
+
+              heuristicCandidate.role = roleArg;
+              heuristicCandidate.salary = salaryArg;
+              heuristicCandidate.custom_requests = customReqArg;
+
+              const evaluation = evaluateHrPolicy(roleArg, salaryArg, customReqArg);
+
+              if (overrideMode === "approve_exception" && !evaluation.is_approved) {
+                evaluation.override_applied = true;
+              }
+
+              policyResult = evaluation;
+
+              const effectiveApproved =
+                evaluation.is_approved || overrideMode === "approve_exception";
+
+              steps.push({
+                id: `step-policy-${turnCount}`,
+                phase: "policy",
+                title: effectiveApproved
+                  ? "HR Policy Verification Passed (verify_hr_policy)"
+                  : "HR Policy Violation Flagged (verify_hr_policy)",
+                detail: effectiveApproved
+                  ? evaluation.override_applied
+                    ? `Executive Override applied for ${matchedBand.title} (${salaryArg.toLocaleString()} SAR/mo). Proceeding to artifact generation.`
+                    : `Verified ${salaryArg.toLocaleString()} SAR/mo is within ${matchedBand.title} cap (${matchedBand.maxSalarySAR.toLocaleString()} SAR/mo).`
+                  : evaluation.policy_warnings.join(" "),
+                status: effectiveApproved ? "completed" : "warning",
+                timestamp: nowIso(),
+                toolName: "verify_hr_policy",
+                toolArgs: {
+                  role: roleArg,
+                  salary: salaryArg,
+                  custom_requests: customReqArg,
+                },
+                toolResult: evaluation,
+              });
+
+              // Check Human-in-the-Loop Pause Gate!
+              if (!effectiveApproved && overrideMode === "none") {
+                haltedForHitl = true;
+                steps.push({
+                  id: "step-hitl-pause",
+                  phase: "hitl",
+                  title: "Paused for Human-in-the-Loop Governance Override",
+                  detail:
+                    "Autonomous agent halted contract generation due to HR policy violation(s). Awaiting human reviewer decision: Approve Exception, Auto-Adjust to Policy Cap, or Reject.",
+                  status: "paused",
+                  timestamp: nowIso(),
+                });
+                break;
+              }
+
+              toolResponseParts.push({
+                functionResponse: {
+                  name: "verify_hr_policy",
+                  response: {
+                    is_approved: effectiveApproved,
+                    policy_warnings: evaluation.policy_warnings,
+                    override_applied: Boolean(evaluation.override_applied),
+                    approved_salary_sar: salaryArg,
+                    instruction:
+                      "Policy check complete and approved. Now call BOTH generate_offer_letter and create_it_ticket.",
+                  },
+                },
+              });
+            } else if (fnName === "generate_offer_letter") {
+              const candidateNameArg = String(
+                args.candidate_name || heuristicCandidate.candidate_name
+              );
+              const roleArg = String(args.role || heuristicCandidate.role);
+              let salaryArg = Number(args.salary || heuristicCandidate.salary);
+              if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
+              if (overrideMode === "cap_to_band") {
+                const band = matchRoleBand(roleArg);
+                if (salaryArg > band.maxSalarySAR) salaryArg = band.maxSalarySAR;
+              }
+              const startDateArg = String(
+                args.start_date || heuristicCandidate.start_date
+              );
+
+              heuristicCandidate.candidate_name = candidateNameArg;
+              heuristicCandidate.role = roleArg;
+              heuristicCandidate.salary = salaryArg;
+              heuristicCandidate.start_date = startDateArg;
+
+              offerLetterMarkdown = buildOfferLetterMarkdown({
+                candidate_name: candidateNameArg,
+                role: roleArg,
+                salary: salaryArg,
+                start_date: startDateArg,
+                custom_notes: heuristicCandidate.custom_requests,
+                override_approved: overrideMode === "approve_exception",
+              });
+
+              steps.push({
+                id: `step-offer-${turnCount}`,
+                phase: "offer",
+                title: "Drafted Employment Offer Letter (generate_offer_letter)",
+                detail: `Generated formal KSA Employment Contract for ${candidateNameArg} (${roleArg} @ ${salaryArg.toLocaleString()} SAR/mo, starting ${startDateArg}).`,
+                status: "completed",
+                timestamp: nowIso(),
+                toolName: "generate_offer_letter",
+                toolArgs: {
+                  candidate_name: candidateNameArg,
+                  role: roleArg,
+                  salary: salaryArg,
+                  start_date: startDateArg,
+                },
+                toolResult: {
+                  contract_status: "GENERATED",
+                  markdown_length: offerLetterMarkdown.length,
+                },
+              });
+
+              toolResponseParts.push({
+                functionResponse: {
+                  name: "generate_offer_letter",
+                  response: {
+                    status: "success",
+                    offer_letter_markdown: offerLetterMarkdown,
+                  },
+                },
+              });
+            } else if (fnName === "create_it_ticket") {
+              const roleArg = String(args.role || heuristicCandidate.role);
+              const hardwareReqsArg = Array.isArray(args.hardware_requests)
+                ? args.hardware_requests.map(String)
+                : heuristicCandidate.hardware_requests;
+
+              heuristicCandidate.hardware_requests = hardwareReqsArg;
+
+              itTicketPayload = buildItTicketPayload({
+                candidate_name: heuristicCandidate.candidate_name,
+                role: roleArg,
+                start_date: heuristicCandidate.start_date,
+                hardware_requests: hardwareReqsArg,
+                override_approved: overrideMode === "approve_exception",
+              });
+
+              steps.push({
+                id: `step-it-${turnCount}`,
+                phase: "it_ticket",
+                title: "Created IT & IAM Provisioning Ticket (create_it_ticket)",
+                detail: `Dispatched ticket ${itTicketPayload.ticket_id} with ${itTicketPayload.hardware_bundle.length} hardware assets and ${itTicketPayload.zero_trust_access.length} Zero-Trust IAM groups.`,
+                status: "completed",
+                timestamp: nowIso(),
+                toolName: "create_it_ticket",
+                toolArgs: {
+                  role: roleArg,
+                  hardware_requests: hardwareReqsArg,
+                },
+                toolResult: itTicketPayload,
+              });
+
+              toolResponseParts.push({
+                functionResponse: {
+                  name: "create_it_ticket",
+                  response: {
+                    status: "success",
+                    ticket: itTicketPayload,
+                  },
+                },
+              });
+            }
+          }
+
+          if (haltedForHitl) {
+            break;
+          }
+
+          if (toolResponseParts.length > 0) {
+            contents.push({
+              role: "user",
+              parts: toolResponseParts,
+            });
+
+            response = await ai.models.generateContent({
+              model: usedModelName,
+              contents,
+              config: {
+                systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
+                tools: AGENT_TOOLS,
+                temperature: 0.1,
+              },
+            });
+          } else {
+            break;
+          }
+        }
+
+        if (haltedForHitl) {
+          return NextResponse.json({
+            status: "awaiting_override",
+            engineMode,
+            model: usedModelName,
+            candidate: heuristicCandidate,
+            policyResult,
+            offerLetterMarkdown: null,
+            itTicket: null,
+            steps,
+            agentSummary:
+              "Onboarding workflow paused at the Governance Gate. One or more HR policy thresholds were exceeded. Please review the flagged warnings and either Approve an Executive Override, Auto-Adjust to Policy Cap, or Reject the request.",
+          });
+        }
+
+        // Ensure all 3 tools were executed if policy was approved (in case the LLM stopped early after 1 tool)
+        if (!policyResult) {
+          const band = matchRoleBand(heuristicCandidate.role);
+          if (overrideMode === "cap_to_band" && heuristicCandidate.salary > band.maxSalarySAR) {
+            heuristicCandidate.salary = band.maxSalarySAR;
+            heuristicCandidate.custom_requests = [];
+          }
+          policyResult = evaluateHrPolicy(
+            heuristicCandidate.role,
+            heuristicCandidate.salary,
+            heuristicCandidate.custom_requests
+          );
+          if (overrideMode === "approve_exception" && !policyResult.is_approved) {
+            policyResult.override_applied = true;
+          }
+          const effectiveApproved =
+            policyResult.is_approved || overrideMode === "approve_exception";
+
+          steps.push({
+            id: "step-policy-ensured",
+            phase: "policy",
+            title: effectiveApproved
+              ? "HR Policy Verification Passed (verify_hr_policy)"
+              : "HR Policy Violation Flagged (verify_hr_policy)",
+            detail: effectiveApproved
+              ? `Verified ${heuristicCandidate.salary.toLocaleString()} SAR/mo against ${band.title} band.`
+              : policyResult.policy_warnings.join(" "),
+            status: effectiveApproved ? "completed" : "warning",
+            timestamp: nowIso(),
+            toolName: "verify_hr_policy",
+            toolArgs: {
+              role: heuristicCandidate.role,
+              salary: heuristicCandidate.salary,
+              custom_requests: heuristicCandidate.custom_requests,
+            },
+            toolResult: policyResult,
+          });
+
+          if (!effectiveApproved && overrideMode === "none") {
+            steps.push({
+              id: "step-hitl-pause",
+              phase: "hitl",
+              title: "Paused for Human-in-the-Loop Governance Override",
+              detail:
+                "Autonomous agent halted contract generation due to HR policy violation(s).",
+              status: "paused",
+              timestamp: nowIso(),
+            });
+            return NextResponse.json({
+              status: "awaiting_override",
+              engineMode,
+              model: usedModelName,
+              candidate: heuristicCandidate,
+              policyResult,
+              offerLetterMarkdown: null,
+              itTicket: null,
+              steps,
+              agentSummary:
+                "Onboarding workflow paused at the Governance Gate due to HR policy violation(s).",
+            });
+          }
+        }
+
+        if (!offerLetterMarkdown) {
+          offerLetterMarkdown = buildOfferLetterMarkdown({
+            candidate_name: heuristicCandidate.candidate_name,
+            role: heuristicCandidate.role,
+            salary: heuristicCandidate.salary,
+            start_date: heuristicCandidate.start_date,
+            custom_notes: heuristicCandidate.custom_requests,
+            override_approved: overrideMode === "approve_exception",
+          });
+          steps.push({
+            id: "step-offer-ensured",
+            phase: "offer",
+            title: "Drafted Employment Offer Letter (generate_offer_letter)",
+            detail: `Generated formal KSA Employment Contract for ${heuristicCandidate.candidate_name}.`,
+            status: "completed",
+            timestamp: nowIso(),
+            toolName: "generate_offer_letter",
+            toolArgs: {
+              candidate_name: heuristicCandidate.candidate_name,
+              role: heuristicCandidate.role,
+              salary: heuristicCandidate.salary,
+              start_date: heuristicCandidate.start_date,
+            },
+            toolResult: {
+              contract_status: "GENERATED",
+              markdown_length: offerLetterMarkdown.length,
+            },
+          });
+        }
+
+        if (!itTicketPayload) {
+          itTicketPayload = buildItTicketPayload({
+            candidate_name: heuristicCandidate.candidate_name,
+            role: heuristicCandidate.role,
+            start_date: heuristicCandidate.start_date,
+            hardware_requests: heuristicCandidate.hardware_requests,
+            override_approved: overrideMode === "approve_exception",
+          });
+          steps.push({
+            id: "step-it-ensured",
+            phase: "it_ticket",
+            title: "Created IT & IAM Provisioning Ticket (create_it_ticket)",
+            detail: `Dispatched ticket ${itTicketPayload.ticket_id} to ${itTicketPayload.assigned_queue}.`,
+            status: "completed",
+            timestamp: nowIso(),
+            toolName: "create_it_ticket",
+            toolArgs: {
+              role: heuristicCandidate.role,
+              hardware_requests: heuristicCandidate.hardware_requests,
+            },
+            toolResult: itTicketPayload,
+          });
+        }
+
+        agentSummary =
+          response?.text ||
+          `Successfully onboarded ${heuristicCandidate.candidate_name} as ${heuristicCandidate.role} (${heuristicCandidate.salary.toLocaleString()} SAR/month, starting ${heuristicCandidate.start_date}). Offer Letter and IT Provisioning Ticket (${itTicketPayload.ticket_id}) are ready for execution.`;
+
+        steps.push({
+          id: "step-complete",
+          phase: "complete",
+          title: "Autonomous Onboarding Package Finalized",
+          detail: `Offer contract and IT ticket ${itTicketPayload.ticket_id} synthesized and ready for dispatch.`,
+          status: "completed",
+          timestamp: nowIso(),
+        });
+
+        return NextResponse.json({
+          status: "completed",
+          engineMode,
+          model: usedModelName,
+          candidate: heuristicCandidate,
+          policyResult,
+          offerLetterMarkdown,
+          itTicket: itTicketPayload,
+          steps,
+          agentSummary,
+        });
+      } catch (geminiError) {
+        console.warn("Gemini API call failed, falling back to deterministic tool execution:", geminiError);
+        engineMode = "simulated_fallback";
+      }
+    }
+
+    // ========================================================================
+    // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set)
+    // ========================================================================
+    const matchedBand = matchRoleBand(heuristicCandidate.role);
+    if (overrideMode === "cap_to_band") {
+      if (heuristicCandidate.salary > matchedBand.maxSalarySAR) {
+        heuristicCandidate.salary = matchedBand.maxSalarySAR;
+      }
+      heuristicCandidate.custom_requests = [];
+    }
+
+    policyResult = evaluateHrPolicy(
+      heuristicCandidate.role,
+      heuristicCandidate.salary,
+      heuristicCandidate.custom_requests
+    );
+
+    if (overrideMode === "approve_exception" && !policyResult.is_approved) {
+      policyResult.override_applied = true;
+    }
+
+    const effectiveApproved =
+      policyResult.is_approved || overrideMode === "approve_exception";
+
+    steps.push({
+      id: "step-policy-sim",
+      phase: "policy",
+      title: effectiveApproved
+        ? "HR Policy Verification Passed (verify_hr_policy)"
+        : "HR Policy Violation Flagged (verify_hr_policy)",
+      detail: effectiveApproved
+        ? policyResult.override_applied
+          ? `Executive Override applied for ${matchedBand.title} (${heuristicCandidate.salary.toLocaleString()} SAR/mo).`
+          : `Verified ${heuristicCandidate.salary.toLocaleString()} SAR/mo is within ${matchedBand.title} maximum cap of ${matchedBand.maxSalarySAR.toLocaleString()} SAR/mo.`
+        : policyResult.policy_warnings.join(" "),
+      status: effectiveApproved ? "completed" : "warning",
+      timestamp: nowIso(),
+      toolName: "verify_hr_policy",
+      toolArgs: {
+        role: heuristicCandidate.role,
+        salary: heuristicCandidate.salary,
+        custom_requests: heuristicCandidate.custom_requests,
+      },
+      toolResult: policyResult,
+    });
+
+    if (!effectiveApproved && overrideMode === "none") {
+      steps.push({
+        id: "step-hitl-pause",
+        phase: "hitl",
+        title: "Paused for Human-in-the-Loop Governance Override",
+        detail:
+          "Autonomous agent halted contract generation due to HR policy violation(s). Awaiting human reviewer decision.",
+        status: "paused",
+        timestamp: nowIso(),
+      });
+
+      return NextResponse.json({
+        status: "awaiting_override",
+        engineMode,
+        model: "deterministic-tool-engine",
+        candidate: heuristicCandidate,
+        policyResult,
+        offerLetterMarkdown: null,
+        itTicket: null,
+        steps,
+        agentSummary:
+          "Onboarding workflow paused at the Governance Gate. One or more HR policy thresholds were exceeded. Please review the flagged warnings and either Approve an Executive Override, Auto-Adjust to Policy Cap, or Reject the request.",
+      });
+    }
+
+    // Tool 2: generate_offer_letter
+    offerLetterMarkdown = buildOfferLetterMarkdown({
+      candidate_name: heuristicCandidate.candidate_name,
+      role: heuristicCandidate.role,
+      salary: heuristicCandidate.salary,
+      start_date: heuristicCandidate.start_date,
+      custom_notes: heuristicCandidate.custom_requests,
+      override_approved: overrideMode === "approve_exception",
+    });
+
+    steps.push({
+      id: "step-offer-sim",
+      phase: "offer",
+      title: "Drafted Employment Offer Letter (generate_offer_letter)",
+      detail: `Generated formal KSA Employment Contract for ${heuristicCandidate.candidate_name} (${heuristicCandidate.role} @ ${heuristicCandidate.salary.toLocaleString()} SAR/mo, starting ${heuristicCandidate.start_date}).`,
+      status: "completed",
+      timestamp: nowIso(),
+      toolName: "generate_offer_letter",
+      toolArgs: {
+        candidate_name: heuristicCandidate.candidate_name,
+        role: heuristicCandidate.role,
+        salary: heuristicCandidate.salary,
+        start_date: heuristicCandidate.start_date,
+      },
+      toolResult: {
+        contract_status: "GENERATED",
+        markdown_length: offerLetterMarkdown.length,
+      },
+    });
+
+    // Tool 3: create_it_ticket
+    itTicketPayload = buildItTicketPayload({
+      candidate_name: heuristicCandidate.candidate_name,
+      role: heuristicCandidate.role,
+      start_date: heuristicCandidate.start_date,
+      hardware_requests: heuristicCandidate.hardware_requests,
+      override_approved: overrideMode === "approve_exception",
+    });
+
+    steps.push({
+      id: "step-it-sim",
+      phase: "it_ticket",
+      title: "Created IT & IAM Provisioning Ticket (create_it_ticket)",
+      detail: `Dispatched ticket ${itTicketPayload.ticket_id} with ${itTicketPayload.hardware_bundle.length} hardware assets and ${itTicketPayload.zero_trust_access.length} Zero-Trust IAM groups.`,
+      status: "completed",
+      timestamp: nowIso(),
+      toolName: "create_it_ticket",
+      toolArgs: {
+        role: heuristicCandidate.role,
+        hardware_requests: heuristicCandidate.hardware_requests,
+      },
+      toolResult: itTicketPayload,
+    });
+
+    steps.push({
+      id: "step-complete-sim",
+      phase: "complete",
+      title: "Autonomous Onboarding Package Finalized",
+      detail: `Offer contract and IT ticket ${itTicketPayload.ticket_id} synthesized and ready for dispatch.`,
+      status: "completed",
+      timestamp: nowIso(),
+    });
+
+    agentSummary = `Successfully onboarded ${heuristicCandidate.candidate_name} for ${heuristicCandidate.role} at ${heuristicCandidate.salary.toLocaleString()} SAR/month starting ${heuristicCandidate.start_date}. Both the Employment Contract and IT Ticket (${itTicketPayload.ticket_id}) have been generated.`;
+
+    return NextResponse.json({
+      status: "completed",
+      engineMode,
+      model: "deterministic-tool-engine",
+      candidate: heuristicCandidate,
+      policyResult,
+      offerLetterMarkdown,
+      itTicket: itTicketPayload,
+      steps,
+      agentSummary,
+    });
+  } catch (error: unknown) {
+    console.error("Agent API Error:", error);
+    const message =
+      error instanceof Error ? error.message : "Unexpected error in Autonomous Onboarding Agent.";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
