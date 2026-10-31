@@ -193,17 +193,43 @@ export function findMatchingRoleBand(roleInput: string): SalaryBand | null {
     return null;
   }
 
-  // 1. Check exact title or whole-phrase alias matches in priority order
+  // 1. Check exact title or exact alias match first
   for (const band of COMPANY_SALARY_BANDS) {
     if (band.title.toLowerCase() === normalized) {
       return band;
     }
     for (const alias of band.aliases) {
-      const escapedAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const aliasRegex = new RegExp(`\\b${escapedAlias}\\b`, "i");
-      if (aliasRegex.test(normalized)) {
+      if (alias.toLowerCase() === normalized) {
         return band;
       }
+    }
+  }
+
+  // 2. Check whole-phrase alias matches sorted by longest (most specific) alias first
+  // so "senior developer" or "senior software engineer" matches senior_dev before "developer" matches mid_dev
+  const allAliases: { alias: string; band: SalaryBand }[] = [];
+  for (const band of COMPANY_SALARY_BANDS) {
+    allAliases.push({ alias: band.title.toLowerCase(), band });
+    for (const alias of band.aliases) {
+      allAliases.push({ alias: alias.toLowerCase(), band });
+    }
+  }
+  allAliases.sort((a, b) => b.alias.length - a.alias.length);
+
+  for (const { alias, band } of allAliases) {
+    // Do not let generic mid_dev aliases override explicit seniority keywords
+    if (
+      band.id === "mid_dev" &&
+      /\b(senior|sr|lead|junior|jr|associate|intern|staff|principal|head|director|vp|manager)\b/i.test(
+        normalized
+      )
+    ) {
+      continue;
+    }
+    const escapedAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const aliasRegex = new RegExp(`\\b${escapedAlias}\\b`, "i");
+    if (aliasRegex.test(normalized)) {
+      return band;
     }
   }
 

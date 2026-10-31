@@ -12,6 +12,7 @@ import {
   Laptop,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Terminal,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -59,6 +60,7 @@ export function AgentStateVisualizer({
   steps,
   status,
 }: AgentStateVisualizerProps) {
+  const [isTraceExpanded, setIsTraceExpanded] = useState<boolean>(true);
   const [expandedStepIds, setExpandedStepIds] = useState<Record<string, boolean>>({});
 
   const toggleExpand = (id: string) => {
@@ -68,47 +70,68 @@ export function AgentStateVisualizer({
   if (status === "idle" && steps.length === 0 && !isLoading) {
     return (
       <div className="rounded-xl border border-slate-800/80 bg-slate-900/50 p-4">
-        <div className="flex items-center justify-between mb-3">
+        <button
+          type="button"
+          onClick={() => setIsTraceExpanded((prev) => !prev)}
+          className={`w-full flex items-center justify-between text-left transition-colors hover:opacity-90 ${
+            isTraceExpanded ? "mb-3" : ""
+          }`}
+        >
           <div className="flex items-center gap-2">
             <div className="h-2 w-2 rounded-full bg-slate-500" />
             <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Agentic State Visualizer
+              Agentic Reasoning & Function Calling Trace
             </span>
           </div>
-          <Badge variant="outline" className="text-[11px] border-slate-700 text-slate-400">
-            Standby — Ready for Input
-          </Badge>
-        </div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
-          <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
-            <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" />
-            <div>
-              <div className="font-mono text-[11px] text-slate-200">verify_hr_policy</div>
-              <div className="text-[11px] text-slate-500">Salary & PTO Band Check</div>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="text-[11px] border-slate-700 text-slate-400">
+              Standby — Ready for Input
+            </Badge>
+            {isTraceExpanded ? (
+              <ChevronUp className="h-4 w-4 text-slate-400" />
+            ) : (
+              <ChevronDown className="h-4 w-4 text-slate-400" />
+            )}
+          </div>
+        </button>
+        {isTraceExpanded && (
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+            <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
+              <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0" />
+              <div>
+                <div className="font-mono text-[11px] text-slate-200">verify_hr_policy</div>
+                <div className="text-[11px] text-slate-500">Salary & PTO Band Check</div>
+              </div>
+            </div>
+            <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
+              <FileSignature className="h-4 w-4 text-sky-400 shrink-0" />
+              <div>
+                <div className="font-mono text-[11px] text-slate-200">generate_offer_letter</div>
+                <div className="text-[11px] text-slate-500">Markdown Contract Engine</div>
+              </div>
+            </div>
+            <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
+              <Laptop className="h-4 w-4 text-violet-400 shrink-0" />
+              <div>
+                <div className="font-mono text-[11px] text-slate-200">create_it_ticket</div>
+                <div className="text-[11px] text-slate-500">Hardware & IAM JSON</div>
+              </div>
             </div>
           </div>
-          <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
-            <FileSignature className="h-4 w-4 text-sky-400 shrink-0" />
-            <div>
-              <div className="font-mono text-[11px] text-slate-200">generate_offer_letter</div>
-              <div className="text-[11px] text-slate-500">Markdown Contract Engine</div>
-            </div>
-          </div>
-          <div className="rounded-lg border border-slate-800/70 bg-slate-950/60 p-2.5 flex items-center gap-2.5 text-slate-400">
-            <Laptop className="h-4 w-4 text-violet-400 shrink-0" />
-            <div>
-              <div className="font-mono text-[11px] text-slate-200">create_it_ticket</div>
-              <div className="text-[11px] text-slate-500">Hardware & IAM JSON</div>
-            </div>
-          </div>
-        </div>
+        )}
       </div>
     );
   }
 
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 shadow-inner">
-      <div className="flex items-center justify-between mb-3">
+      <button
+        type="button"
+        onClick={() => setIsTraceExpanded((prev) => !prev)}
+        className={`w-full flex items-center justify-between text-left transition-colors hover:opacity-90 ${
+          isTraceExpanded ? "mb-3" : ""
+        }`}
+      >
         <div className="flex items-center gap-2">
           <span
             className={`h-2.5 w-2.5 rounded-full ${
@@ -127,27 +150,36 @@ export function AgentStateVisualizer({
             Agentic Reasoning & Function Calling Trace
           </span>
         </div>
-        {isLoading && (
-          <Badge variant="info" className="gap-1.5 text-[11px]">
-            <Loader2 className="h-3 w-3 animate-spin" />
-            Executing Tool Pipeline...
-          </Badge>
-        )}
-        {!isLoading && status === "awaiting_override" && (
-          <Badge variant="warning" className="gap-1.5 text-[11px]">
-            <PauseCircle className="h-3 w-3" />
-            Paused — Human-in-the-Loop Gate
-          </Badge>
-        )}
-        {!isLoading && status === "completed" && (
-          <Badge variant="success" className="gap-1.5 text-[11px]">
-            <CheckCircle2 className="h-3 w-3" />
-            All Functions Executed ({steps.filter((s) => s.toolName).length} Tools)
-          </Badge>
-        )}
-      </div>
+        <div className="flex items-center gap-2">
+          {isLoading && (
+            <Badge variant="info" className="gap-1.5 text-[11px]">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Executing Tool Pipeline...
+            </Badge>
+          )}
+          {!isLoading && status === "awaiting_override" && (
+            <Badge variant="warning" className="gap-1.5 text-[11px]">
+              <PauseCircle className="h-3 w-3" />
+              Paused — Human-in-the-Loop Gate
+            </Badge>
+          )}
+          {!isLoading && status === "completed" && (
+            <Badge variant="success" className="gap-1.5 text-[11px]">
+              <CheckCircle2 className="h-3 w-3" />
+              All Functions Executed ({steps.filter((s) => s.toolName).length} Tools)
+            </Badge>
+          )}
+          {isTraceExpanded ? (
+            <ChevronUp className="h-4 w-4 text-slate-400" />
+          ) : (
+            <ChevronDown className="h-4 w-4 text-slate-400" />
+          )}
+        </div>
+      </button>
 
-      {/* Live in-flight animation */}
+      {isTraceExpanded && (
+        <>
+          {/* Live in-flight animation */}
       {isLoading ? (
         <div className="space-y-2.5">
           {LIVE_PIPELINE_STAGES.slice(0, maxLoadingStage + 1).map((stage, idx) => {
@@ -275,6 +307,8 @@ export function AgentStateVisualizer({
             );
           })}
         </div>
+      )}
+        </>
       )}
     </div>
   );

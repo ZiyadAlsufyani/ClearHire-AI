@@ -147,6 +147,84 @@ function toTitleCase(str: string): string {
     .join(" ");
 }
 
+function isMissingEntity(value: string, kind: "name" | "role"): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized.length < 2) return true;
+
+  // Catch any variation of "MISSING", "Missing Name", "[Missing]", "Unknown", "Not Provided", "N/A", "Candidate", etc.
+  if (
+    /\b(missing|unknown|unspecified|none|n\/a|null|undefined|tbd|tba|not\s+provided|not\s+specified|not\s+mentioned|no\s+name|no\s+role|unnamed|anonymous|candidate|new\s+hire|employee|applicant|person|someone|anyone|placeholder)\b/i.test(
+      normalized
+    ) ||
+    /^\[.*\]$|^<.*>$|^\?+$|^-+$/i.test(normalized)
+  ) {
+    return true;
+  }
+
+  if (kind === "name") {
+    // Reject if the extracted "name" contains conversational pronouns, verbs, articles, or role words
+    if (
+      /\b(we|will|would|like|want|need|employ|hire|hiring|onboard|onboarding|recruit|appoint|bring|our|us|please|to|for|as|the|a|an|role|position|developer|dev|engineer|designer|manager|hr|mid|senior|junior|staff|principal|software|product)\b/i.test(
+        normalized
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Verifies that the raw prompt actually contains at least one token that could be a person's name
+// (i.e. not purely verbs, pronouns, prepositions, role titles, numbers, or hardware/policy keywords)
+function promptHasCandidateNameToken(rawPrompt: string): boolean {
+  const NON_NAME_VOCAB = new Set([
+    // Verbs, pronouns, prepositions, articles, conjunctions
+    "we", "i", "you", "they", "he", "she", "it", "our", "us", "my", "your", "their", "his", "her",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must", "do", "does", "did",
+    "have", "has", "had", "be", "am", "is", "are", "was", "were", "been", "being",
+    "like", "want", "wants", "wanted", "need", "needs", "needed", "looking", "look", "plan", "planning", "decide", "decided",
+    "hire", "hiring", "hired", "employ", "employing", "employed", "onboard", "onboarding", "onboarded",
+    "recruit", "recruiting", "appointed", "appoint", "bring", "bringing", "add", "adding", "assign", "offer", "offered", "offering",
+    "please", "kindly", "urgent", "urgently", "immediately", "asap", "now", "today", "soon",
+    "to", "for", "as", "at", "with", "in", "on", "by", "from", "of", "into", "about", "under", "over", "per",
+    "the", "a", "an", "this", "that", "these", "those", "some", "any", "new", "next", "current", "future",
+    "and", "or", "but", "so", "if", "then", "also", "plus", "without", "within",
+    // Role, seniority, department & domain words
+    "role", "position", "title", "job", "post", "vacancy", "opening", "candidate", "employee", "person", "someone", "anyone", "applicant", "member",
+    "team", "department", "dept", "division", "unit", "group", "company", "organization", "office", "hq", "kafd", "riyadh", "saudi", "arabia", "ksa",
+    "senior", "sr", "junior", "jr", "mid", "middle", "mid-level", "entry", "level", "lead", "leader", "staff", "principal", "chief", "head", "vp", "director", "executive", "associate", "intern", "trainee",
+    "software", "developer", "dev", "engineer", "engineering", "programmer", "coder", "architect", "architecture",
+    "frontend", "front-end", "backend", "back-end", "fullstack", "full-stack", "full", "stack", "web", "mobile", "ios", "android", "cloud", "devops", "sre", "platform", "systems", "system", "security", "cyber", "qa", "test", "testing", "quality",
+    "ai", "ml", "machine", "learning", "deep", "data", "scientist", "science", "analyst", "analytics", "llm", "nlp", "vision", "researcher", "research", "applied",
+    "product", "manager", "management", "pm", "owner", "po", "project", "program", "technical",
+    "designer", "design", "ux", "ui", "ui/ux", "interaction", "visual", "creative", "experience",
+    "hr", "human", "resources", "recruiter", "recruitment", "talent", "acquisition", "people", "operations", "ops", "specialist", "coordinator", "partner", "admin", "administrator", "officer", "consultant",
+    "finance", "financial", "accountant", "accounting", "legal", "counsel", "lawyer", "marketing", "sales", "support", "customer", "success", "business",
+    // Compensation, schedule, dates, PTO & hardware words
+    "salary", "compensation", "pay", "package", "monthly", "month", "annual", "year", "yearly", "sar", "riyal", "riyals", "usd", "k",
+    "start", "starts", "starting", "commencing", "commence", "join", "joining", "date", "day", "days", "week", "weeks", "work", "working", "workweek", "schedule",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "pto", "leave", "vacation", "holiday", "holidays", "allowance", "off", "time",
+    "hybrid", "remote", "fully", "onsite", "on-site", "abroad", "home", "flexible",
+    "bonus", "signing", "sign-on", "relocation", "equity", "stock",
+    "hardware", "laptop", "computer", "workstation", "macbook", "mac", "apple", "pro", "air", "m1", "m2", "m3", "m4", "max", "ultra",
+    "dell", "xps", "thinkpad", "lenovo", "ubuntu", "linux", "windows", "pc", "gaming", "rtx", "gpu", "h100", "cluster", "node", "quota",
+    "monitor", "monitors", "display", "displays", "screen", "ultrasharp", "4k", "dual", "inch", "mouse", "keyboard", "ergonomic", "logitech", "vertical", "headset", "hub", "usb-c",
+    "standard", "policy", "default", "cap", "maximum", "minimum", "band", "tier", "clearance"
+  ]);
+
+  const tokens = rawPrompt
+    .toLowerCase()
+    .replace(/[^a-z\s-]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.replace(/^-+|-+$/g, ""))
+    .filter((t) => t.length >= 2);
+
+  return tokens.some((token) => !NON_NAME_VOCAB.has(token));
+}
+
 function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
   const text = rawNotes.trim();
 
@@ -157,7 +235,7 @@ function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
   let candidateName = "";
   let hasExplicitName = false;
   const namePatterns = [
-    /(?:hire|onboard|candidate\s*[:=-]?|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})/i,
+    /(?:hire|employ|onboard|candidate\s*[:=-]?|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})/i,
     /^([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})\s*(?:[—–,-]|\bfor\b|\bas\b)/im,
   ];
   for (const pattern of namePatterns) {
@@ -165,14 +243,15 @@ function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
     if (match && match[1]) {
       const cleaned = match[1]
         .replace(
-          /\b(for|as|at|with|in|on|starts|starting|urgent|hire|onboard|candidate|role|position|title|offered|salary|wants|needs|senior|junior|jr|sr|staff|principal|lead|mid|developer|dev|engineer|designer|manager|architect|scientist|analyst|intern|pm|ux|ui|ai|ml|hr|it|product|software|frontend|backend|fullstack)\b.*$/i,
+          /\b(for|as|at|with|in|on|starts|starting|urgent|hire|employ|onboard|our|us|we|will|please|to|a|an|the|candidate|role|position|title|offered|salary|wants|needs|senior|junior|jr|sr|staff|principal|lead|mid|developer|dev|engineer|designer|manager|architect|scientist|analyst|intern|pm|ux|ui|ai|ml|hr|it|product|software|frontend|backend|fullstack)\b.*$/i,
           ""
         )
         .trim();
       if (
         cleaned.length >= 2 &&
         /[a-zA-Z]{2,}/.test(cleaned) &&
-        !ROLE_KEYWORDS_REGEX.test(cleaned)
+        !ROLE_KEYWORDS_REGEX.test(cleaned) &&
+        !isMissingEntity(cleaned, "name")
       ) {
         candidateName = toTitleCase(cleaned);
         hasExplicitName = true;
@@ -581,26 +660,21 @@ export async function POST(req: NextRequest) {
               const llmName = String(args.candidate_name || "").trim();
               const llmRole = String(args.role || "").trim();
 
-              const resolvedName =
-                llmName && llmName.toUpperCase() !== "MISSING"
-                  ? llmName
-                  : heuristicCandidate.candidate_name;
-
               // Guard against LLM hallucinating a role when the prompt is just "Hire <Name>" with no role/position words
               const isBareNameOnlyPrompt =
                 !imageBase64 &&
                 !heuristicCandidate.hasExplicitRole &&
-                /^(?:please\s+)?(?:hire|onboard)\s+[a-zA-Z\s.-]+$/i.test(prompt.trim());
+                /^(?:please\s+)?(?:hire|employ|onboard)\s+[a-zA-Z\s.-]+$/i.test(prompt.trim());
 
-              const resolvedRole =
-                !isBareNameOnlyPrompt && llmRole && llmRole.toUpperCase() !== "MISSING"
-                  ? llmRole
-                  : heuristicCandidate.role;
+              // Guard against missing-name prompts (e.g. "we will employ as our mid developer")
+              const hasNameInPrompt =
+                Boolean(imageBase64) || promptHasCandidateNameToken(prompt);
 
-              const hasValidName =
-                Boolean(resolvedName) && resolvedName.toUpperCase() !== "MISSING";
-              const hasValidRole =
-                Boolean(resolvedRole) && resolvedRole.toUpperCase() !== "MISSING";
+              const resolvedName = hasNameInPrompt ? llmName : "MISSING";
+              const resolvedRole = isBareNameOnlyPrompt ? "MISSING" : llmRole;
+
+              const hasValidName = !isMissingEntity(resolvedName, "name");
+              const hasValidRole = !isMissingEntity(resolvedRole, "role");
 
               if (!hasValidName || !hasValidRole) {
                 let missingError =
@@ -608,7 +682,7 @@ export async function POST(req: NextRequest) {
                 if (hasValidName && !hasValidRole) {
                   missingError = `Missing required field (Target Role): Could not extract a job role for ${resolvedName}. Please specify the target role (e.g., 'Hire ${resolvedName} for Senior Dev').`;
                 } else if (!hasValidName && hasValidRole) {
-                  missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${resolvedRole} position.`;
+                  missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${resolvedRole} position (e.g., 'Hire Sarah as our ${resolvedRole}').`;
                 }
                 return NextResponse.json({ error: missingError }, { status: 400 });
               }
@@ -636,7 +710,7 @@ export async function POST(req: NextRequest) {
                   args.hardware_requests.map(String);
               }
 
-              const roleArg = resolvedRole;
+              const roleArg = matchedBand.title;
 
               // Default to highest salary range (matchedBand.maxSalarySAR) if salary was omitted
               let salaryArg = Number(args.salary || 0);
@@ -717,11 +791,12 @@ export async function POST(req: NextRequest) {
                   name: "verify_hr_policy",
                   response: {
                     is_approved: effectiveApproved,
+                    official_role_title: matchedBand.title,
                     policy_warnings: evaluation.policy_warnings,
                     override_applied: Boolean(evaluation.override_applied),
                     approved_salary_sar: salaryArg,
                     instruction:
-                      "Policy check complete and approved. Now call BOTH generate_offer_letter and create_it_ticket.",
+                      `Policy check complete and approved for official role "${matchedBand.title}". Now call BOTH generate_offer_letter and create_it_ticket using role "${matchedBand.title}".`,
                   },
                 },
               });
@@ -729,12 +804,13 @@ export async function POST(req: NextRequest) {
               const candidateNameArg = String(
                 args.candidate_name || heuristicCandidate.candidate_name
               );
-              const roleArg = String(args.role || heuristicCandidate.role);
+              const rawOfferRole = String(args.role || heuristicCandidate.role);
+              const offerBand = matchRoleBand(rawOfferRole);
+              const roleArg = offerBand.title;
               let salaryArg = Number(args.salary || heuristicCandidate.salary);
               if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
               if (overrideMode === "cap_to_band") {
-                const band = matchRoleBand(roleArg);
-                if (salaryArg > band.maxSalarySAR) salaryArg = band.maxSalarySAR;
+                if (salaryArg > offerBand.maxSalarySAR) salaryArg = offerBand.maxSalarySAR;
               }
               const startDateArg = String(
                 args.start_date || heuristicCandidate.start_date
@@ -785,7 +861,8 @@ export async function POST(req: NextRequest) {
                 },
               });
             } else if (fnName === "create_it_ticket") {
-              const roleArg = String(args.role || heuristicCandidate.role);
+              const rawItRole = String(args.role || heuristicCandidate.role);
+              const roleArg = matchRoleBand(rawItRole).title;
               const hardwareReqsArg = Array.isArray(args.hardware_requests)
                 ? args.hardware_requests.map(String)
                 : heuristicCandidate.hardware_requests;
@@ -890,7 +967,28 @@ export async function POST(req: NextRequest) {
 
         // Ensure all 3 tools were executed if policy was approved (in case the LLM stopped early after 1 tool)
         if (!policyResult) {
-          const band = matchRoleBand(heuristicCandidate.role);
+          if (
+            isMissingEntity(heuristicCandidate.candidate_name, "name") ||
+            isMissingEntity(heuristicCandidate.role, "role")
+          ) {
+            return NextResponse.json(
+              {
+                error:
+                  "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').",
+              },
+              { status: 400 }
+            );
+          }
+          const band = findMatchingRoleBand(heuristicCandidate.role);
+          if (!band) {
+            return NextResponse.json(
+              {
+                error: `Unmapped Role Policy Error: The role "${heuristicCandidate.role}" does not have an associated HR policy band.`,
+              },
+              { status: 400 }
+            );
+          }
+          heuristicCandidate.role = band.title;
           if (overrideMode === "cap_to_band" && heuristicCandidate.salary > band.maxSalarySAR) {
             heuristicCandidate.salary = band.maxSalarySAR;
             heuristicCandidate.custom_requests = [];
@@ -1064,6 +1162,7 @@ export async function POST(req: NextRequest) {
         { status: 400 }
       );
     }
+    heuristicCandidate.role = matchedBand.title;
     if (!heuristicCandidate.hasExplicitSalary) {
       heuristicCandidate.salary = matchedBand.maxSalarySAR;
     }
