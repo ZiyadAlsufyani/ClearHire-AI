@@ -1,10 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI, Type, FunctionDeclaration, Part } from "@google/genai";
+import {
+  GoogleGenAI,
+  Type,
+  FunctionDeclaration,
+  FunctionCallingConfigMode,
+  Part,
+} from "@google/genai";
 import {
   COMPANY_POLICY_SYSTEM_PROMPT,
   evaluateHrPolicy,
   buildOfferLetterMarkdown,
   buildItTicketPayload,
+  findMatchingRoleBand,
   matchRoleBand,
   PolicyVerificationResult,
   ItTicketPayload,
@@ -19,17 +26,24 @@ import {
 const verifyHrPolicyDeclaration: FunctionDeclaration = {
   name: "verify_hr_policy",
   description:
-    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy.",
+    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy. Also extracts candidate_name, start_date, and hardware_requests from the user's notes or image.",
   parameters: {
     type: Type.OBJECT,
     properties: {
+      candidate_name: {
+        type: Type.STRING,
+        description:
+          "Full or first name of the candidate extracted from the user's input. CRITICAL: If the user did NOT mention a person's name in the input, you MUST pass the exact string 'MISSING'. Never invent or guess a name.",
+      },
       role: {
         type: Type.STRING,
-        description: "The job title or role being hired for (e.g., 'Senior Dev', 'Senior AI Engineer').",
+        description:
+          "The job title, role, or department being hired for (extracted from the user's input regardless of phrasing or word order). CRITICAL: If the user did NOT mention any job role, title, or department in the input (for example, 'Hire Rimas Alsufyani'), you MUST pass the exact string 'MISSING'. Never invent or guess a role.",
       },
       salary: {
         type: Type.NUMBER,
-        description: "The proposed monthly salary in SAR as a number (e.g., 20000 for 20k SAR).",
+        description:
+          "The proposed monthly salary in SAR as a number (e.g., 20000 for 20k SAR). Pass 0 if the user did not specify a salary so the system can default to the role's maximum salary cap.",
       },
       custom_requests: {
         type: Type.ARRAY,
@@ -37,8 +51,17 @@ const verifyHrPolicyDeclaration: FunctionDeclaration = {
         description:
           "List of any special or custom requests mentioned in the notes (e.g., '30 days PTO', '100% fully remote', '20k signing bonus'). Pass an empty array if none.",
       },
+      start_date: {
+        type: Type.STRING,
+        description: "Optional start date extracted from the notes or image.",
+      },
+      hardware_requests: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description: "Optional list of hardware items requested by the candidate.",
+      },
     },
-    required: ["role", "salary", "custom_requests"],
+    required: ["candidate_name", "role", "salary", "custom_requests"],
   },
 };
 
@@ -103,58 +126,191 @@ const AGENT_TOOLS = [
 ];
 
 // ============================================================================
-// DETERMINISTIC ENTITY PARSER (Used for Fallback or Pre-normalization)
+// DETERMINISTIC ENTITY PARSER & SMART DEFAULTS ENGINE
 // ============================================================================
-function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
+interface HeuristicParseResult extends ExtractedCandidate {
+  hasExplicitName: boolean;
+  hasExplicitRole: boolean;
+  hasExplicitSalary: boolean;
+}
+
+function toTitleCase(str: string): string {
+  return str
+    .trim()
+    .split(/\s+/)
+    .map((word) => {
+      if (/^(hr|it|ai|ml|ui|ux|pm|qa|vp|ceo|cto|cfo|coo|sre|ksa)$/i.test(word)) {
+        return word.toUpperCase();
+      }
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(" ");
+}
+
+function isMissingEntity(value: string, kind: "name" | "role"): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized.length < 2) return true;
+
+  // Catch any variation of "MISSING", "Missing Name", "[Missing]", "Unknown", "Not Provided", "N/A", "Candidate", etc.
+  if (
+    /\b(missing|unknown|unspecified|none|n\/a|null|undefined|tbd|tba|not\s+provided|not\s+specified|not\s+mentioned|no\s+name|no\s+role|unnamed|anonymous|candidate|new\s+hire|employee|applicant|person|someone|anyone|placeholder)\b/i.test(
+      normalized
+    ) ||
+    /^\[.*\]$|^<.*>$|^\?+$|^-+$/i.test(normalized)
+  ) {
+    return true;
+  }
+
+  if (kind === "name") {
+    // Reject if the extracted "name" contains conversational pronouns, verbs, articles, or role words
+    if (
+      /\b(we|will|would|like|want|need|employ|hire|hiring|onboard|onboarding|recruit|appoint|bring|our|us|please|to|for|as|the|a|an|role|position|developer|dev|engineer|designer|manager|hr|mid|senior|junior|staff|principal|software|product)\b/i.test(
+        normalized
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Verifies that the raw prompt actually contains at least one token that could be a person's name
+// (i.e. not purely verbs, pronouns, prepositions, role titles, numbers, or hardware/policy keywords)
+function promptHasCandidateNameToken(rawPrompt: string): boolean {
+  const NON_NAME_VOCAB = new Set([
+    // Verbs, pronouns, prepositions, articles, conjunctions
+    "we", "i", "you", "they", "he", "she", "it", "our", "us", "my", "your", "their", "his", "her",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must", "do", "does", "did",
+    "have", "has", "had", "be", "am", "is", "are", "was", "were", "been", "being",
+    "like", "want", "wants", "wanted", "need", "needs", "needed", "looking", "look", "plan", "planning", "decide", "decided",
+    "hire", "hiring", "hired", "employ", "employing", "employed", "onboard", "onboarding", "onboarded",
+    "recruit", "recruiting", "appointed", "appoint", "bring", "bringing", "add", "adding", "assign", "offer", "offered", "offering",
+    "please", "kindly", "urgent", "urgently", "immediately", "asap", "now", "today", "soon",
+    "to", "for", "as", "at", "with", "in", "on", "by", "from", "of", "into", "about", "under", "over", "per",
+    "the", "a", "an", "this", "that", "these", "those", "some", "any", "new", "next", "current", "future",
+    "and", "or", "but", "so", "if", "then", "also", "plus", "without", "within",
+    // Role, seniority, department & domain words
+    "role", "position", "title", "job", "post", "vacancy", "opening", "candidate", "employee", "person", "someone", "anyone", "applicant", "member",
+    "team", "department", "dept", "division", "unit", "group", "company", "organization", "office", "hq", "kafd", "riyadh", "saudi", "arabia", "ksa",
+    "senior", "sr", "junior", "jr", "mid", "middle", "mid-level", "entry", "level", "lead", "leader", "staff", "principal", "chief", "head", "vp", "director", "executive", "associate", "intern", "trainee",
+    "software", "developer", "dev", "engineer", "engineering", "programmer", "coder", "architect", "architecture",
+    "frontend", "front-end", "backend", "back-end", "fullstack", "full-stack", "full", "stack", "web", "mobile", "ios", "android", "cloud", "devops", "sre", "platform", "systems", "system", "security", "cyber", "qa", "test", "testing", "quality",
+    "ai", "ml", "machine", "learning", "deep", "data", "scientist", "science", "analyst", "analytics", "llm", "nlp", "vision", "researcher", "research", "applied",
+    "product", "manager", "management", "pm", "owner", "po", "project", "program", "technical",
+    "designer", "design", "ux", "ui", "ui/ux", "interaction", "visual", "creative", "experience",
+    "hr", "human", "resources", "recruiter", "recruitment", "talent", "acquisition", "people", "operations", "ops", "specialist", "coordinator", "partner", "admin", "administrator", "officer", "consultant",
+    "finance", "financial", "accountant", "accounting", "legal", "counsel", "lawyer", "marketing", "sales", "support", "customer", "success", "business",
+    // Compensation, schedule, dates, PTO & hardware words
+    "salary", "compensation", "pay", "package", "monthly", "month", "annual", "year", "yearly", "sar", "riyal", "riyals", "usd", "k",
+    "start", "starts", "starting", "commencing", "commence", "join", "joining", "date", "day", "days", "week", "weeks", "work", "working", "workweek", "schedule",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "pto", "leave", "vacation", "holiday", "holidays", "allowance", "off", "time",
+    "hybrid", "remote", "fully", "onsite", "on-site", "abroad", "home", "flexible",
+    "bonus", "signing", "sign-on", "relocation", "equity", "stock",
+    "hardware", "laptop", "computer", "workstation", "macbook", "mac", "apple", "pro", "air", "m1", "m2", "m3", "m4", "max", "ultra",
+    "dell", "xps", "thinkpad", "lenovo", "ubuntu", "linux", "windows", "pc", "gaming", "rtx", "gpu", "h100", "cluster", "node", "quota",
+    "monitor", "monitors", "display", "displays", "screen", "ultrasharp", "4k", "dual", "inch", "mouse", "keyboard", "ergonomic", "logitech", "vertical", "headset", "hub", "usb-c",
+    "standard", "policy", "default", "cap", "maximum", "minimum", "band", "tier", "clearance"
+  ]);
+
+  const tokens = rawPrompt
+    .toLowerCase()
+    .replace(/[^a-z\s-]/g, " ")
+    .split(/\s+/)
+    .map((t) => t.replace(/^-+|-+$/g, ""))
+    .filter((t) => t.length >= 2);
+
+  return tokens.some((token) => !NON_NAME_VOCAB.has(token));
+}
+
+function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
   const text = rawNotes.trim();
 
-  // Extract candidate name
-  let candidateName = "Sarah Al-Mansoor";
+  const ROLE_KEYWORDS_REGEX =
+    /\b(dev|developer|engineer|engineering|designer|design|manager|management|architect|scientist|science|analyst|researcher|specialist|director|lead|intern|consultant|coordinator|officer|administrator|admin|pm|ux|ui|qa|devops|sre|data|ai|ml|product|software|frontend|backend|fullstack|cloud|security|hr|human\s+resources|recruiter|talent|finance|accountant|marketing|sales|operations|support|legal|counsel|executive|vp|cto|ceo|cfo|coo)\b/i;
+
+  // 1. Extract candidate name (supports 1 to 4 name parts, case-insensitive, and inverted word order)
+  let candidateName = "";
+  let hasExplicitName = false;
   const namePatterns = [
-    /(?:hire|onboard|candidate|offer\s+for|for|name\s*[:=-])\s+(?:dr\.?\s+)?([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,2})/i,
-    /^([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)?)\s*[—–-]/m,
+    /(?:hire|employ|onboard|candidate\s*[:=-]?|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})/i,
+    /^([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})\s*(?:[—–,-]|\bfor\b|\bas\b)/im,
   ];
   for (const pattern of namePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
       const cleaned = match[1]
-        .replace(/\b(for|as|at|in|on|starts|starting|urgent|hire)\b.*$/i, "")
+        .replace(
+          /\b(for|as|at|with|in|on|starts|starting|urgent|hire|employ|onboard|our|us|we|will|please|to|a|an|the|candidate|role|position|title|offered|salary|wants|needs|senior|junior|jr|sr|staff|principal|lead|mid|developer|dev|engineer|designer|manager|architect|scientist|analyst|intern|pm|ux|ui|ai|ml|hr|it|product|software|frontend|backend|fullstack)\b.*$/i,
+          ""
+        )
         .trim();
-      if (cleaned.length >= 2) {
-        candidateName = cleaned;
+      if (
+        cleaned.length >= 2 &&
+        /[a-zA-Z]{2,}/.test(cleaned) &&
+        !ROLE_KEYWORDS_REGEX.test(cleaned) &&
+        !isMissingEntity(cleaned, "name")
+      ) {
+        candidateName = toTitleCase(cleaned);
+        hasExplicitName = true;
         break;
       }
     }
   }
 
-  // Extract role
-  let role = "Senior Software Engineer";
+  // 2. Extract role (supports both "hire X for Y" and inverted "for Y role hire X")
+  let role = "";
+  let hasExplicitRole = false;
   const rolePatterns = [
-    /(?:for|as|role\s*[:=-]|position\s*[:=-])\s+([A-Za-z0-9\s/+-]+?)(?:,|\.|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|\n|$)/i,
+    /(?:for|as|role\s*[:=-]|position\s*[:=-]|title\s*[:=-])\s+(?:a\s+|an\s+|the\s+)?([A-Za-z0-9\s/+-]+?)(?:\s+role\b|\s+position\b)?(?:\s+(?:hire|onboard|candidate|for)\b|,|\.|;|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|wants|needs|requested|\n|$)/i,
+    /\b((?:senior|junior|jr|sr|staff|principal|lead|mid|chief|head\s+of|vp\s+of|ai|ml|product|ux|ui|software|fullstack|full\s+stack|frontend|front-end|backend|back-end|cloud|devops|security|data|qa|hr)\s+(?:[A-Za-z/+-]+\s+)?(?:dev|developer|software\s+engineer|ai\s+engineer|ml\s+engineer|engineer|designer|product\s+designer|product\s+manager|manager|architect|scientist|analyst|researcher|specialist|director|intern|consultant|coordinator|officer|recruiter|pm|role))\b/i,
+    /\b(software\s+engineer|product\s+manager|product\s+designer|ux\s+designer|ui\s+designer|data\s+scientist|data\s+analyst|ai\s+engineer|ml\s+engineer|devops\s+engineer|cloud\s+architect|engineering\s+manager|project\s+manager|hr\s+specialist|hr\s+manager|human\s+resources|developer|engineer|designer|architect|scientist|analyst|hr|recruiter)\b/i,
   ];
   for (const pattern of rolePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      const candidateRole = match[1].trim();
-      if (candidateRole.length >= 2 && candidateRole.length <= 45) {
-        role = candidateRole;
+      const candidateRole = match[1]
+        .replace(
+          /\b(hire|onboard|candidate|starts|starting|at|with|offered|wants|needs|in\s+riyadh|hybrid|remote)\b.*$/i,
+          ""
+        )
+        .replace(/\s+\b(role|position|title)$/i, "")
+        .trim();
+      if (
+        candidateRole.length >= 2 &&
+        candidateRole.length <= 50 &&
+        !/^\d/.test(candidateRole) &&
+        candidateRole.toLowerCase() !== candidateName.toLowerCase() &&
+        ROLE_KEYWORDS_REGEX.test(candidateRole)
+      ) {
+        role = toTitleCase(candidateRole);
+        hasExplicitRole = true;
         break;
       }
     }
   }
 
-  // Extract salary in SAR
-  let salary = 20000;
+  const matchedBand = matchRoleBand(role || "Senior Software Engineer");
+
+  // 3. Extract salary in SAR (Default to HIGHEST salary cap for the role if omitted!)
+  let salary = matchedBand.maxSalarySAR;
+  let hasExplicitSalary = false;
   const kMatch = text.match(/(\d+(?:\.\d+)?)\s*k\s*(?:sar)?/i);
-  const fullNumMatch = text.match(/(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i);
+  const fullNumMatch = text.match(
+    /(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i
+  );
   if (kMatch) {
     salary = Math.round(parseFloat(kMatch[1]) * 1000);
+    hasExplicitSalary = true;
   } else if (fullNumMatch) {
     salary = parseInt(fullNumMatch[1].replace(/,/g, ""), 10);
+    hasExplicitSalary = true;
   }
 
-  // Extract start date
-  let startDate = "November 1, 2026";
+  // 4. Extract start date (Default to standard 2-week onboarding lead time if omitted)
+  let startDate = "November 15, 2026";
   const dateMatch = text.match(
     /(?:starts?|starting|commencing|from|date\s*[:=-])\s*([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?|\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{2,4})/i
   );
@@ -162,7 +318,7 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     startDate = dateMatch[1].trim();
   }
 
-  // Extract custom requests
+  // 5. Extract custom requests (Default to empty -> standard 21d PTO & Hybrid schedule)
   const customRequests: string[] = [];
   const ptoMatch = text.match(/(\d+\s*days?\s*(?:pto|leave|vacation|holiday))/i);
   if (ptoMatch) customRequests.push(ptoMatch[1]);
@@ -175,7 +331,7 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
   const bonusMatch = text.match(/(\d+\s*k?\s*(?:sar\s*)?(?:signing|sign-on)\s*bonus)/i);
   if (bonusMatch) customRequests.push(bonusMatch[1]);
 
-  // Extract hardware requests
+  // 6. Extract hardware requests (Default to role's standard workstation bundle if omitted)
   const hardwareRequests: string[] = [];
   if (/macbook\s*pro|mbp|m3\s*max|16-inch\s*mac/i.test(text)) {
     hardwareRequests.push('Apple MacBook Pro 16" (M3 Max)');
@@ -195,7 +351,12 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     hardwareRequests.push("Dedicated Cloud H100 GPU Node Quota");
   }
   if (hardwareRequests.length === 0) {
-    hardwareRequests.push("Standard Role Workstation Bundle");
+    hardwareRequests.push(
+      matchedBand.hardwareTier === "BUSINESS_STANDARD"
+        ? 'Apple MacBook Air 15" (M3)'
+        : 'Apple MacBook Pro 16" (M3 Max)',
+      'Dell UltraSharp 27" 4K USB-C Hub Monitor'
+    );
   }
 
   return {
@@ -205,6 +366,9 @@ function extractCandidateHeuristic(rawNotes: string): ExtractedCandidate {
     start_date: startDate,
     custom_requests: customRequests,
     hardware_requests: hardwareRequests,
+    hasExplicitName,
+    hasExplicitRole,
+    hasExplicitSalary,
   };
 }
 
@@ -216,19 +380,142 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const {
+      action = "run_agent", // "run_agent" | "extract_image"
       prompt = "",
       imageBase64,
       imageMimeType,
+      fallbackHint = "",
       overrideMode = "none", // "none" | "approve_exception" | "cap_to_band"
       apiKey: clientApiKey,
+      selectedModel = "auto",
+      forceSandbox = false,
     } = body as {
+      action?: "run_agent" | "extract_image";
       prompt?: string;
       imageBase64?: string;
       imageMimeType?: string;
+      fallbackHint?: string;
       overrideMode?: "none" | "approve_exception" | "cap_to_band";
       apiKey?: string;
+      selectedModel?: string;
+      forceSandbox?: boolean;
     };
 
+    const resolvedApiKey =
+      (clientApiKey && clientApiKey.trim()) ||
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      "";
+
+    const defaultFallbackModels = [
+      "gemini-3.8-flash",
+      "gemini-3.5-flash-lite",
+      "gemini-flash-latest",
+      "gemini-2.5-flash",
+    ];
+    const candidateModels =
+      selectedModel && selectedModel !== "auto"
+        ? [
+            selectedModel,
+            ...defaultFallbackModels.filter((m) => m !== selectedModel),
+          ]
+        : defaultFallbackModels;
+
+    // ========================================================================
+    // MODE 1: MULTIMODAL IMAGE-TO-TEXT EXTRACTION (action === "extract_image")
+    // ========================================================================
+    if (action === "extract_image") {
+      if (!imageBase64) {
+        return NextResponse.json(
+          { error: "No image provided for text extraction." },
+          { status: 400 }
+        );
+      }
+
+      if (!forceSandbox) {
+        if (!resolvedApiKey) {
+          return NextResponse.json({
+            status: "gemini_error",
+            geminiError: true,
+            errorMessage:
+              "No Gemini API Key is configured to extract text from this image with Gemini Vision. Would you like to proceed using the Tool Sandbox fallback?",
+          });
+        }
+
+        try {
+          const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
+          let visionResponse = null;
+          let lastErr: unknown = null;
+          let usedModel = candidateModels[0];
+
+          for (const modelName of candidateModels) {
+            try {
+              usedModel = modelName;
+              visionResponse = await ai.models.generateContent({
+                model: modelName,
+                contents: [
+                  {
+                    role: "user",
+                    parts: [
+                      {
+                        inlineData: {
+                          data: imageBase64.replace(/^data:[^;]+;base64,/, ""),
+                          mimeType: imageMimeType || "image/png",
+                        },
+                      },
+                      {
+                        text: "Transcribe and extract the hiring request details from this handwritten interview note or resume image into a clear, editable hiring request note. Include Candidate Name, Target Role, Monthly Salary (in SAR if present), Start Date, Leave/PTO/Work Arrangement, and IT Hardware requests. Return ONLY the plain text hiring request notes without markdown code fences.",
+                      },
+                    ],
+                  },
+                ],
+                config: {
+                  temperature: 0.1,
+                },
+              });
+              break;
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+
+          if (!visionResponse || !visionResponse.text) {
+            throw lastErr || new Error("Gemini Vision returned an empty response.");
+          }
+
+          return NextResponse.json({
+            status: "extracted",
+            extractedText: visionResponse.text.trim(),
+            engineMode: "gemini_live",
+            model: usedModel,
+          });
+        } catch (err: unknown) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "Gemini Vision failed to extract text from the uploaded image.";
+          return NextResponse.json({
+            status: "gemini_error",
+            geminiError: true,
+            errorMessage: `Gemini Vision API Error: ${msg}`,
+          });
+        }
+      }
+
+      // User confirmed Tool Sandbox fallback for image extraction
+      return NextResponse.json({
+        status: "extracted",
+        extractedText:
+          fallbackHint ||
+          "Hire Tariq Al-Dosari for Senior Software Engineer, 23,500 SAR/month, starts November 15, 2026. Standard 21 days PTO, hybrid in Riyadh. Wants 16-inch MacBook Pro M3 Max and 4K Monitor.",
+        engineMode: "simulated_fallback",
+        model: "deterministic-tool-engine",
+      });
+    }
+
+    // ========================================================================
+    // MODE 2: MAIN AUTONOMOUS ONBOARDING AGENT (action === "run_agent")
+    // ========================================================================
     if (!prompt.trim() && !imageBase64) {
       return NextResponse.json(
         { error: "Please provide hiring request notes or upload an interview note image." },
@@ -239,24 +526,26 @@ export async function POST(req: NextRequest) {
     const steps: AgentStepLog[] = [];
     const nowIso = () => new Date().toISOString();
 
-    const resolvedApiKey =
-      (clientApiKey && clientApiKey.trim()) ||
-      process.env.GEMINI_API_KEY ||
-      process.env.GOOGLE_API_KEY ||
-      "";
+    const heuristicCandidate = extractCandidateHeuristic(prompt);
 
-    const heuristicCandidate = extractCandidateHeuristic(
-      prompt || "Hire Nadia Al-Zahrani for Senior Product Designer, 21k SAR, starts Nov 10, 2026, wants MacBook Pro and 4K monitor."
-    );
+    // If user hasn't confirmed Tool Sandbox and no API key is configured, ask confirmation first!
+    if (!forceSandbox && !resolvedApiKey) {
+      return NextResponse.json({
+        status: "gemini_error",
+        geminiError: true,
+        errorMessage:
+          "No Gemini API Key is configured. Would you like to proceed using the Deterministic Tool Sandbox instead?",
+      });
+    }
 
     let policyResult: PolicyVerificationResult | null = null;
     let offerLetterMarkdown: string | null = null;
     let itTicketPayload: ItTicketPayload | null = null;
     let agentSummary = "";
-    let engineMode: "gemini_live" | "simulated_fallback" = resolvedApiKey
-      ? "gemini_live"
-      : "simulated_fallback";
-    let usedModelName = "gemini-2.5-flash";
+    let engineMode: "gemini_live" | "simulated_fallback" =
+      resolvedApiKey && !forceSandbox ? "gemini_live" : "simulated_fallback";
+    let usedModelName =
+      selectedModel && selectedModel !== "auto" ? selectedModel : "gemini-3.8-flash";
 
     // Step 1: Parsing input
     steps.push({
@@ -264,7 +553,7 @@ export async function POST(req: NextRequest) {
       phase: "parse",
       title: imageBase64
         ? "Multimodal Vision + Text Parsing"
-        : "Analyzing Unstructured Hiring Request",
+        : "Analyzing Hiring Request Notes",
       detail: imageBase64
         ? "Extracting candidate entities, compensation, and hardware needs from uploaded image and notes..."
         : "Tokenizing recruiter notes to extract candidate name, target role, SAR compensation, start date, and hardware requests.",
@@ -275,10 +564,9 @@ export async function POST(req: NextRequest) {
     // ========================================================================
     // LIVE GEMINI FUNCTION-CALLING PIPELINE (@google/genai)
     // ========================================================================
-    if (resolvedApiKey) {
+    if (resolvedApiKey && !forceSandbox) {
       try {
         const ai = new GoogleGenAI({ apiKey: resolvedApiKey });
-        const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
 
         const userParts: Part[] = [];
         if (imageBase64 && imageMimeType) {
@@ -310,6 +598,14 @@ export async function POST(req: NextRequest) {
         let response = null;
         let lastModelError: unknown = null;
 
+        // On initial check (overrideMode === "none"), ONLY allow verify_hr_policy on Turn 1
+        // so that if there is a policy violation, Gemini never wastes tokens/time calling
+        // generate_offer_letter or create_it_ticket before halting!
+        const initialAllowedFunctions =
+          overrideMode === "none"
+            ? ["verify_hr_policy"]
+            : ["verify_hr_policy", "generate_offer_letter", "create_it_ticket"];
+
         for (const modelName of candidateModels) {
           try {
             usedModelName = modelName;
@@ -319,6 +615,12 @@ export async function POST(req: NextRequest) {
               config: {
                 systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
                 tools: AGENT_TOOLS,
+                toolConfig: {
+                  functionCallingConfig: {
+                    mode: FunctionCallingConfigMode.ANY,
+                    allowedFunctionNames: initialAllowedFunctions,
+                  },
+                },
                 temperature: 0.1,
               },
             });
@@ -355,8 +657,68 @@ export async function POST(req: NextRequest) {
             const args = (fnCall.args || {}) as Record<string, unknown>;
 
             if (fnName === "verify_hr_policy") {
-              const roleArg = String(args.role || heuristicCandidate.role);
-              let salaryArg = Number(args.salary || heuristicCandidate.salary);
+              const llmName = String(args.candidate_name || "").trim();
+              const llmRole = String(args.role || "").trim();
+
+              // Guard against LLM hallucinating a role when the prompt is just "Hire <Name>" with no role/position words
+              const isBareNameOnlyPrompt =
+                !imageBase64 &&
+                !heuristicCandidate.hasExplicitRole &&
+                /^(?:please\s+)?(?:hire|employ|onboard)\s+[a-zA-Z\s.-]+$/i.test(prompt.trim());
+
+              // Guard against missing-name prompts (e.g. "we will employ as our mid developer")
+              const hasNameInPrompt =
+                Boolean(imageBase64) || promptHasCandidateNameToken(prompt);
+
+              const resolvedName = hasNameInPrompt ? llmName : "MISSING";
+              const resolvedRole = isBareNameOnlyPrompt ? "MISSING" : llmRole;
+
+              const hasValidName = !isMissingEntity(resolvedName, "name");
+              const hasValidRole = !isMissingEntity(resolvedRole, "role");
+
+              if (!hasValidName || !hasValidRole) {
+                let missingError =
+                  "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').";
+                if (hasValidName && !hasValidRole) {
+                  missingError = `Missing required field (Target Role): Could not extract a job role for ${resolvedName}. Please specify the target role (e.g., 'Hire ${resolvedName} for Senior Dev').`;
+                } else if (!hasValidName && hasValidRole) {
+                  missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${resolvedRole} position (e.g., 'Hire Sarah as our ${resolvedRole}').`;
+                }
+                return NextResponse.json({ error: missingError }, { status: 400 });
+              }
+
+              // Verify that the extracted role has an associated company HR policy band
+              const matchedBand = findMatchingRoleBand(resolvedRole);
+              if (!matchedBand) {
+                return NextResponse.json(
+                  {
+                    error: `Unmapped Role Policy Error: The role "${resolvedRole}" does not have an associated HR policy band. Supported HR policy roles are: Junior/Mid/Senior Software Engineer, Senior AI/ML Engineer, Staff/Principal Engineer, Senior Product Designer, Product Manager, and HR & People Operations Specialist.`,
+                  },
+                  { status: 400 }
+                );
+              }
+
+              heuristicCandidate.candidate_name = resolvedName;
+              if (args.start_date) {
+                heuristicCandidate.start_date = String(args.start_date);
+              }
+              if (
+                Array.isArray(args.hardware_requests) &&
+                args.hardware_requests.length > 0
+              ) {
+                heuristicCandidate.hardware_requests =
+                  args.hardware_requests.map(String);
+              }
+
+              const roleArg = matchedBand.title;
+
+              // Default to highest salary range (matchedBand.maxSalarySAR) if salary was omitted
+              let salaryArg = Number(args.salary || 0);
+              if (!salaryArg || isNaN(salaryArg)) {
+                salaryArg = heuristicCandidate.hasExplicitSalary
+                  ? heuristicCandidate.salary
+                  : matchedBand.maxSalarySAR;
+              }
               if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
 
               let customReqArg = Array.isArray(args.custom_requests)
@@ -364,7 +726,6 @@ export async function POST(req: NextRequest) {
                 : heuristicCandidate.custom_requests;
 
               // If user selected "cap_to_band", clamp salary & custom requests to policy limits
-              const matchedBand = matchRoleBand(roleArg);
               if (overrideMode === "cap_to_band") {
                 if (salaryArg > matchedBand.maxSalarySAR) {
                   salaryArg = matchedBand.maxSalarySAR;
@@ -426,14 +787,16 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "verify_hr_policy",
                   response: {
                     is_approved: effectiveApproved,
+                    official_role_title: matchedBand.title,
                     policy_warnings: evaluation.policy_warnings,
                     override_applied: Boolean(evaluation.override_applied),
                     approved_salary_sar: salaryArg,
                     instruction:
-                      "Policy check complete and approved. Now call BOTH generate_offer_letter and create_it_ticket.",
+                      `Policy check complete and approved for official role "${matchedBand.title}". Now call BOTH generate_offer_letter and create_it_ticket using role "${matchedBand.title}".`,
                   },
                 },
               });
@@ -441,12 +804,13 @@ export async function POST(req: NextRequest) {
               const candidateNameArg = String(
                 args.candidate_name || heuristicCandidate.candidate_name
               );
-              const roleArg = String(args.role || heuristicCandidate.role);
+              const rawOfferRole = String(args.role || heuristicCandidate.role);
+              const offerBand = matchRoleBand(rawOfferRole);
+              const roleArg = offerBand.title;
               let salaryArg = Number(args.salary || heuristicCandidate.salary);
               if (salaryArg > 0 && salaryArg < 200) salaryArg *= 1000;
               if (overrideMode === "cap_to_band") {
-                const band = matchRoleBand(roleArg);
-                if (salaryArg > band.maxSalarySAR) salaryArg = band.maxSalarySAR;
+                if (salaryArg > offerBand.maxSalarySAR) salaryArg = offerBand.maxSalarySAR;
               }
               const startDateArg = String(
                 args.start_date || heuristicCandidate.start_date
@@ -488,6 +852,7 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "generate_offer_letter",
                   response: {
                     status: "success",
@@ -496,7 +861,8 @@ export async function POST(req: NextRequest) {
                 },
               });
             } else if (fnName === "create_it_ticket") {
-              const roleArg = String(args.role || heuristicCandidate.role);
+              const rawItRole = String(args.role || heuristicCandidate.role);
+              const roleArg = matchRoleBand(rawItRole).title;
               const hardwareReqsArg = Array.isArray(args.hardware_requests)
                 ? args.hardware_requests.map(String)
                 : heuristicCandidate.hardware_requests;
@@ -528,6 +894,7 @@ export async function POST(req: NextRequest) {
 
               toolResponseParts.push({
                 functionResponse: {
+                  ...(fnCall.id ? { id: fnCall.id } : {}),
                   name: "create_it_ticket",
                   response: {
                     status: "success",
@@ -542,11 +909,21 @@ export async function POST(req: NextRequest) {
             break;
           }
 
+          // If all 3 tools have finished executing, stop immediately without making
+          // an extra round-trip API call to Gemini (saves API quota and latency!)
+          if (policyResult && offerLetterMarkdown && itTicketPayload) {
+            break;
+          }
+
           if (toolResponseParts.length > 0) {
             contents.push({
               role: "user",
               parts: toolResponseParts,
             });
+
+            const remainingFunctions: string[] = [];
+            if (!offerLetterMarkdown) remainingFunctions.push("generate_offer_letter");
+            if (!itTicketPayload) remainingFunctions.push("create_it_ticket");
 
             response = await ai.models.generateContent({
               model: usedModelName,
@@ -554,6 +931,17 @@ export async function POST(req: NextRequest) {
               config: {
                 systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
                 tools: AGENT_TOOLS,
+                toolConfig: {
+                  functionCallingConfig:
+                    remainingFunctions.length > 0
+                      ? {
+                          mode: FunctionCallingConfigMode.ANY,
+                          allowedFunctionNames: remainingFunctions,
+                        }
+                      : {
+                          mode: FunctionCallingConfigMode.AUTO,
+                        },
+                },
                 temperature: 0.1,
               },
             });
@@ -579,7 +967,28 @@ export async function POST(req: NextRequest) {
 
         // Ensure all 3 tools were executed if policy was approved (in case the LLM stopped early after 1 tool)
         if (!policyResult) {
-          const band = matchRoleBand(heuristicCandidate.role);
+          if (
+            isMissingEntity(heuristicCandidate.candidate_name, "name") ||
+            isMissingEntity(heuristicCandidate.role, "role")
+          ) {
+            return NextResponse.json(
+              {
+                error:
+                  "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').",
+              },
+              { status: 400 }
+            );
+          }
+          const band = findMatchingRoleBand(heuristicCandidate.role);
+          if (!band) {
+            return NextResponse.json(
+              {
+                error: `Unmapped Role Policy Error: The role "${heuristicCandidate.role}" does not have an associated HR policy band.`,
+              },
+              { status: 400 }
+            );
+          }
+          heuristicCandidate.role = band.title;
           if (overrideMode === "cap_to_band" && heuristicCandidate.salary > band.maxSalarySAR) {
             heuristicCandidate.salary = band.maxSalarySAR;
             heuristicCandidate.custom_requests = [];
@@ -694,9 +1103,7 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        agentSummary =
-          response?.text ||
-          `Successfully onboarded ${heuristicCandidate.candidate_name} as ${heuristicCandidate.role} (${heuristicCandidate.salary.toLocaleString()} SAR/month, starting ${heuristicCandidate.start_date}). Offer Letter and IT Provisioning Ticket (${itTicketPayload.ticket_id}) are ready for execution.`;
+        agentSummary = `Successfully onboarded ${heuristicCandidate.candidate_name} for ${heuristicCandidate.role} at ${heuristicCandidate.salary.toLocaleString()} SAR/month starting ${heuristicCandidate.start_date}. Both the Employment Contract and IT Ticket (${itTicketPayload.ticket_id}) have been generated.`;
 
         steps.push({
           id: "step-complete",
@@ -718,16 +1125,47 @@ export async function POST(req: NextRequest) {
           steps,
           agentSummary,
         });
-      } catch (geminiError) {
-        console.warn("Gemini API call failed, falling back to deterministic tool execution:", geminiError);
-        engineMode = "simulated_fallback";
+      } catch (geminiError: unknown) {
+        console.warn("Gemini API call failed:", geminiError);
+        const errMsg =
+          geminiError instanceof Error
+            ? geminiError.message
+            : "Failed to communicate with the Gemini API.";
+        return NextResponse.json({
+          status: "gemini_error",
+          geminiError: true,
+          errorMessage: `Gemini API Error: ${errMsg}`,
+        });
       }
     }
 
     // ========================================================================
-    // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set)
+    // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set or fallback)
     // ========================================================================
-    const matchedBand = matchRoleBand(heuristicCandidate.role);
+    if (!heuristicCandidate.candidate_name || !heuristicCandidate.role) {
+      let missingError =
+        "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').";
+      if (heuristicCandidate.candidate_name && !heuristicCandidate.role) {
+        missingError = `Missing required field (Target Role): Could not extract a job role for ${heuristicCandidate.candidate_name}. Please specify the target role (e.g., 'Hire ${heuristicCandidate.candidate_name} for Senior Dev').`;
+      } else if (!heuristicCandidate.candidate_name && heuristicCandidate.role) {
+        missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${heuristicCandidate.role} position.`;
+      }
+      return NextResponse.json({ error: missingError }, { status: 400 });
+    }
+
+    const matchedBand = findMatchingRoleBand(heuristicCandidate.role);
+    if (!matchedBand) {
+      return NextResponse.json(
+        {
+          error: `Unmapped Role Policy Error: The role "${heuristicCandidate.role}" does not have an associated HR policy band. Supported HR policy roles are: Junior/Mid/Senior Software Engineer, Senior AI/ML Engineer, Staff/Principal Engineer, Senior Product Designer, Product Manager, and HR & People Operations Specialist.`,
+        },
+        { status: 400 }
+      );
+    }
+    heuristicCandidate.role = matchedBand.title;
+    if (!heuristicCandidate.hasExplicitSalary) {
+      heuristicCandidate.salary = matchedBand.maxSalarySAR;
+    }
     if (overrideMode === "cap_to_band") {
       if (heuristicCandidate.salary > matchedBand.maxSalarySAR) {
         heuristicCandidate.salary = matchedBand.maxSalarySAR;
