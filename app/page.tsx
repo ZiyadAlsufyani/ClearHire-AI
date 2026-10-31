@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useRef, useEffect } from "react";
+import Image from "next/image";
 import {
   Sparkles,
   Send,
@@ -19,7 +20,7 @@ import {
   RotateCcw,
   UserCheck,
   Scale,
-  Cpu,
+
   AlertTriangle,
   SlidersHorizontal,
   ChevronDown,
@@ -409,8 +410,15 @@ export default function ClearHireDashboard() {
       <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur-md">
         <div className="mx-auto flex max-w-[1600px] items-center justify-between px-4 py-3 sm:px-6">
           <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-sky-600 shadow-lg shadow-emerald-500/20">
-              <Cpu className="h-5 w-5 text-white" />
+            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl overflow-hidden shadow-lg shadow-emerald-500/20 border border-slate-700/60 bg-slate-900">
+              <Image
+                src="/logo.png"
+                alt="ClearHire AI Logo"
+                width={40}
+                height={40}
+                className="h-full w-full object-cover"
+                priority
+              />
             </div>
             <div>
               <div className="flex items-center gap-2.5">

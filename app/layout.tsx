@@ -5,6 +5,16 @@ export const metadata: Metadata = {
   title: "ClearHire AI | Autonomous Enterprise Onboarding Agent",
   description:
     "AI Employee Onboarding Agent powered by Gemini Function Calling — Cross-references unstructured hiring requests against HR policy and autonomously generates Offer Letters and IT Provisioning Tickets.",
+  icons: {
+    icon: [
+      { url: "/logo.png" },
+      { url: "/favicon.ico" },
+    ],
+    shortcut: ["/logo.png"],
+    apple: [
+      { url: "/logo.png" },
+    ],
+  },
 };
 
 export default function RootLayout({
