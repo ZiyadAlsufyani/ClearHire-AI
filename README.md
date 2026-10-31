@@ -5,6 +5,7 @@
 **Developed for the HUMAIN Hackathon**
 
 [![Hackathon](https://img.shields.io/badge/HUMAIN_Hackathon-2026-blueviolet?style=for-the-badge&logo=target)](https://humain.ai)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-clearhire--ai.vercel.app-00C7B7?style=for-the-badge&logo=vercel)](https://clearhire-ai.vercel.app/)
 [![Next.js](https://img.shields.io/badge/Next.js_15-App_Router-black?style=for-the-badge&logo=next.js)](https://nextjs.org)
 [![Google Gemini](https://img.shields.io/badge/Google_Gemini-2.5_Flash_Function_Calling-4285F4?style=for-the-badge&logo=google)](https://deepmind.google/technologies/gemini/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
@@ -13,6 +14,10 @@
 
 <p align="center">
   <strong>Transform messy recruiter notes & handwritten interview memos into legally binding employment contracts and Zero-Trust IT tickets in under 5 seconds.</strong>
+</p>
+
+<p align="center">
+  🌐 <strong>Production Live Demo:</strong> <a href="https://clearhire-ai.vercel.app/">https://clearhire-ai.vercel.app/</a>
 </p>
 
 [Problem & Solution](#-the-solution-clearhire-ai) •
