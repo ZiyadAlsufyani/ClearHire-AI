@@ -48,6 +48,8 @@ import {
   ItTicketPayload,
   AgentStepLog,
   ExtractedCandidate,
+  evaluateHrPolicy,
+  matchRoleBand,
 } from "@/lib/policies";
 import { generateSampleHandwrittenNoteImage } from "@/lib/sample-handwritten-note";
 
@@ -108,6 +110,7 @@ export default function ClearHireDashboard() {
   const [status, setStatus] = useState<WorkflowStatus>("idle");
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [activeLoadingStage, setActiveLoadingStage] = useState<number>(0);
+  const [maxLoadingStage, setMaxLoadingStage] = useState<number>(3);
   const [steps, setSteps] = useState<AgentStepLog[]>([]);
   const [candidate, setCandidate] = useState<ExtractedCandidate | null>(null);
   const [policyResult, setPolicyResult] =
@@ -130,10 +133,12 @@ export default function ClearHireDashboard() {
       return;
     }
     const interval = setInterval(() => {
-      setActiveLoadingStage((prev) => (prev < 3 ? prev + 1 : prev));
+      setActiveLoadingStage((prev) =>
+        prev < maxLoadingStage ? prev + 1 : prev
+      );
     }, 550);
     return () => clearInterval(interval);
-  }, [isLoading]);
+  }, [isLoading, maxLoadingStage]);
 
   // Extract text from an uploaded or sample image via Gemini Vision
   const extractImageNotes = async (
@@ -240,6 +245,42 @@ export default function ClearHireDashboard() {
     forceSandbox: boolean = false
   ) => {
     if (!prompt.trim() || isExtractingImage) return;
+
+    // Pre-determine if this request will halt at verify_hr_policy() so the UI
+    // visualizer stops immediately at HR policy verification on violations
+    if (overrideMode === "none") {
+      const text = prompt.trim();
+      const roleMatch = text.match(
+        /(?:for|as|role\s*[:=-]|position\s*[:=-]|title\s*[:=-])\s+(?:a\s+|an\s+|the\s+)?([A-Za-z0-9\s/+-]+?)(?:,|\.|;|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|wants|needs|requested|\n|$)/i
+      );
+      const detectedRole = roleMatch?.[1]?.trim() || text;
+      const band = matchRoleBand(detectedRole);
+      const kMatch = text.match(/(\d+(?:\.\d+)?)\s*k\s*(?:sar)?/i);
+      const fullNumMatch = text.match(
+        /(\d{2,3},\d{3}|\d{5,6})\s*(?:sar|riyal|per\s*month|\/month)?/i
+      );
+      const detectedSalary = kMatch
+        ? Math.round(parseFloat(kMatch[1]) * 1000)
+        : fullNumMatch
+        ? parseInt(fullNumMatch[1].replace(/,/g, ""), 10)
+        : band.maxSalarySAR;
+      const customReqs: string[] = [];
+      const ptoMatch = text.match(/(\d+\s*days?\s*(?:pto|leave|vacation|holiday))/i);
+      if (ptoMatch) customReqs.push(ptoMatch[1]);
+      if (/100%\s*(?:fully\s*)?remote|fully\s*remote|work\s*from\s*abroad/i.test(text)) {
+        customReqs.push("100% Fully Remote Work Arrangement");
+      }
+      if (/4-day|4\s+day\s+work/i.test(text)) {
+        customReqs.push("4-day workweek schedule");
+      }
+      const bonusMatch = text.match(/(\d+\s*k?\s*(?:sar\s*)?(?:signing|sign-on)\s*bonus)/i);
+      if (bonusMatch) customReqs.push(bonusMatch[1]);
+
+      const check = evaluateHrPolicy(detectedRole, detectedSalary, customReqs);
+      setMaxLoadingStage(check.is_approved ? 3 : 1);
+    } else {
+      setMaxLoadingStage(3);
+    }
 
     setIsLoading(true);
     setErrorMessage(null);
@@ -785,6 +826,7 @@ export default function ClearHireDashboard() {
           <AgentStateVisualizer
             isLoading={isLoading}
             activeLoadingStage={activeLoadingStage}
+            maxLoadingStage={maxLoadingStage}
             steps={steps}
             status={status}
           />

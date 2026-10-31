@@ -11,6 +11,7 @@ import {
   evaluateHrPolicy,
   buildOfferLetterMarkdown,
   buildItTicketPayload,
+  findMatchingRoleBand,
   matchRoleBand,
   PolicyVerificationResult,
   ItTicketPayload,
@@ -25,27 +26,30 @@ import {
 const verifyHrPolicyDeclaration: FunctionDeclaration = {
   name: "verify_hr_policy",
   description:
-    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy. Also accepts candidate_name, start_date, and hardware_requests if extracted from the notes or image.",
+    "Cross-references the candidate's proposed role, monthly salary (in SAR), and any custom requests (such as extra PTO days, remote work, or signing bonuses) against official company HR policy. Also extracts candidate_name, start_date, and hardware_requests from the user's notes or image.",
   parameters: {
     type: Type.OBJECT,
     properties: {
+      candidate_name: {
+        type: Type.STRING,
+        description:
+          "Full or first name of the candidate extracted from the user's input. CRITICAL: If the user did NOT mention a person's name in the input, you MUST pass the exact string 'MISSING'. Never invent or guess a name.",
+      },
       role: {
         type: Type.STRING,
-        description: "The job title or role being hired for (e.g., 'Senior Dev', 'Senior AI Engineer').",
+        description:
+          "The job title, role, or department being hired for (extracted from the user's input regardless of phrasing or word order). CRITICAL: If the user did NOT mention any job role, title, or department in the input (for example, 'Hire Rimas Alsufyani'), you MUST pass the exact string 'MISSING'. Never invent or guess a role.",
       },
       salary: {
         type: Type.NUMBER,
-        description: "The proposed monthly salary in SAR as a number (e.g., 20000 for 20k SAR).",
+        description:
+          "The proposed monthly salary in SAR as a number (e.g., 20000 for 20k SAR). Pass 0 if the user did not specify a salary so the system can default to the role's maximum salary cap.",
       },
       custom_requests: {
         type: Type.ARRAY,
         items: { type: Type.STRING },
         description:
           "List of any special or custom requests mentioned in the notes (e.g., '30 days PTO', '100% fully remote', '20k signing bonus'). Pass an empty array if none.",
-      },
-      candidate_name: {
-        type: Type.STRING,
-        description: "Optional full name of the candidate extracted from the notes or image.",
       },
       start_date: {
         type: Type.STRING,
@@ -57,7 +61,7 @@ const verifyHrPolicyDeclaration: FunctionDeclaration = {
         description: "Optional list of hardware items requested by the candidate.",
       },
     },
-    required: ["role", "salary", "custom_requests"],
+    required: ["candidate_name", "role", "salary", "custom_requests"],
   },
 };
 
@@ -130,46 +134,79 @@ interface HeuristicParseResult extends ExtractedCandidate {
   hasExplicitSalary: boolean;
 }
 
+function toTitleCase(str: string): string {
+  return str
+    .trim()
+    .split(/\s+/)
+    .map((word) => {
+      if (/^(hr|it|ai|ml|ui|ux|pm|qa|vp|ceo|cto|cfo|coo|sre|ksa)$/i.test(word)) {
+        return word.toUpperCase();
+      }
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(" ");
+}
+
 function extractCandidateHeuristic(rawNotes: string): HeuristicParseResult {
   const text = rawNotes.trim();
 
-  // 1. Extract candidate name
+  const ROLE_KEYWORDS_REGEX =
+    /\b(dev|developer|engineer|engineering|designer|design|manager|management|architect|scientist|science|analyst|researcher|specialist|director|lead|intern|consultant|coordinator|officer|administrator|admin|pm|ux|ui|qa|devops|sre|data|ai|ml|product|software|frontend|backend|fullstack|cloud|security|hr|human\s+resources|recruiter|talent|finance|accountant|marketing|sales|operations|support|legal|counsel|executive|vp|cto|ceo|cfo|coo)\b/i;
+
+  // 1. Extract candidate name (supports 1 to 4 name parts, case-insensitive, and inverted word order)
   let candidateName = "";
   let hasExplicitName = false;
   const namePatterns = [
-    /(?:hire|onboard|candidate|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+){0,2})/i,
-    /^([A-Z][a-zA-Z-]+(?:\s+[A-Z][a-zA-Z-]+)?)\s*(?:[—–,-]|\bfor\b|\bas\b)/m,
+    /(?:hire|onboard|candidate\s*[:=-]?|offer\s+for|name\s*[:=-])\s+(?:dr\.?\s+)?([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})/i,
+    /^([a-zA-Z][a-zA-Z-]+(?:\s+[a-zA-Z][a-zA-Z-]+){0,3})\s*(?:[—–,-]|\bfor\b|\bas\b)/im,
   ];
   for (const pattern of namePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
       const cleaned = match[1]
         .replace(
-          /\b(for|as|at|in|on|starts|starting|urgent|hire|senior|junior|developer|engineer|designer|manager)\b.*$/i,
+          /\b(for|as|at|with|in|on|starts|starting|urgent|hire|onboard|candidate|role|position|title|offered|salary|wants|needs|senior|junior|jr|sr|staff|principal|lead|mid|developer|dev|engineer|designer|manager|architect|scientist|analyst|intern|pm|ux|ui|ai|ml|hr|it|product|software|frontend|backend|fullstack)\b.*$/i,
           ""
         )
         .trim();
-      if (cleaned.length >= 2) {
-        candidateName = cleaned;
+      if (
+        cleaned.length >= 2 &&
+        /[a-zA-Z]{2,}/.test(cleaned) &&
+        !ROLE_KEYWORDS_REGEX.test(cleaned)
+      ) {
+        candidateName = toTitleCase(cleaned);
         hasExplicitName = true;
         break;
       }
     }
   }
 
-  // 2. Extract role
+  // 2. Extract role (supports both "hire X for Y" and inverted "for Y role hire X")
   let role = "";
   let hasExplicitRole = false;
   const rolePatterns = [
-    /(?:for|as|role\s*[:=-]|position\s*[:=-]|title\s*[:=-])\s+([A-Za-z0-9\s/+-]+?)(?:,|\.|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|\n|$)/i,
-    /\b((?:senior|junior|jr|sr|staff|principal|lead|mid|ai|ml|product|ux|ui|software|fullstack|frontend|backend)\s+(?:dev|developer|software\s+engineer|ai\s+engineer|ml\s+engineer|engineer|designer|product\s+designer|product\s+manager|manager|architect))\b/i,
+    /(?:for|as|role\s*[:=-]|position\s*[:=-]|title\s*[:=-])\s+(?:a\s+|an\s+|the\s+)?([A-Za-z0-9\s/+-]+?)(?:\s+role\b|\s+position\b)?(?:\s+(?:hire|onboard|candidate|for)\b|,|\.|;|at\s+\d|with\s+\d|offered|\d+\s*k|\d{2,3},?\d{3}|starts|starting|wants|needs|requested|\n|$)/i,
+    /\b((?:senior|junior|jr|sr|staff|principal|lead|mid|chief|head\s+of|vp\s+of|ai|ml|product|ux|ui|software|fullstack|full\s+stack|frontend|front-end|backend|back-end|cloud|devops|security|data|qa|hr)\s+(?:[A-Za-z/+-]+\s+)?(?:dev|developer|software\s+engineer|ai\s+engineer|ml\s+engineer|engineer|designer|product\s+designer|product\s+manager|manager|architect|scientist|analyst|researcher|specialist|director|intern|consultant|coordinator|officer|recruiter|pm|role))\b/i,
+    /\b(software\s+engineer|product\s+manager|product\s+designer|ux\s+designer|ui\s+designer|data\s+scientist|data\s+analyst|ai\s+engineer|ml\s+engineer|devops\s+engineer|cloud\s+architect|engineering\s+manager|project\s+manager|hr\s+specialist|hr\s+manager|human\s+resources|developer|engineer|designer|architect|scientist|analyst|hr|recruiter)\b/i,
   ];
   for (const pattern of rolePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      const candidateRole = match[1].trim();
-      if (candidateRole.length >= 2 && candidateRole.length <= 45) {
-        role = candidateRole;
+      const candidateRole = match[1]
+        .replace(
+          /\b(hire|onboard|candidate|starts|starting|at|with|offered|wants|needs|in\s+riyadh|hybrid|remote)\b.*$/i,
+          ""
+        )
+        .replace(/\s+\b(role|position|title)$/i, "")
+        .trim();
+      if (
+        candidateRole.length >= 2 &&
+        candidateRole.length <= 50 &&
+        !/^\d/.test(candidateRole) &&
+        candidateRole.toLowerCase() !== candidateName.toLowerCase() &&
+        ROLE_KEYWORDS_REGEX.test(candidateRole)
+      ) {
+        role = toTitleCase(candidateRole);
         hasExplicitRole = true;
         break;
       }
@@ -410,12 +447,7 @@ export async function POST(req: NextRequest) {
     const steps: AgentStepLog[] = [];
     const nowIso = () => new Date().toISOString();
 
-    const heuristicCandidate = extractCandidateHeuristic(
-      prompt ||
-        (imageBase64
-          ? "Hire Tariq Al-Dosari for Senior Software Engineer, 23,500 SAR/month, starts November 15, 2026."
-          : "")
-    );
+    const heuristicCandidate = extractCandidateHeuristic(prompt);
 
     // If user hasn't confirmed Tool Sandbox and no API key is configured, ask confirmation first!
     if (!forceSandbox && !resolvedApiKey) {
@@ -487,6 +519,14 @@ export async function POST(req: NextRequest) {
         let response = null;
         let lastModelError: unknown = null;
 
+        // On initial check (overrideMode === "none"), ONLY allow verify_hr_policy on Turn 1
+        // so that if there is a policy violation, Gemini never wastes tokens/time calling
+        // generate_offer_letter or create_it_ticket before halting!
+        const initialAllowedFunctions =
+          overrideMode === "none"
+            ? ["verify_hr_policy"]
+            : ["verify_hr_policy", "generate_offer_letter", "create_it_ticket"];
+
         for (const modelName of candidateModels) {
           try {
             usedModelName = modelName;
@@ -499,6 +539,7 @@ export async function POST(req: NextRequest) {
                 toolConfig: {
                   functionCallingConfig: {
                     mode: FunctionCallingConfigMode.ANY,
+                    allowedFunctionNames: initialAllowedFunctions,
                   },
                 },
                 temperature: 0.1,
@@ -537,12 +578,53 @@ export async function POST(req: NextRequest) {
             const args = (fnCall.args || {}) as Record<string, unknown>;
 
             if (fnName === "verify_hr_policy") {
-              if (
-                args.candidate_name &&
-                String(args.candidate_name).toUpperCase() !== "MISSING"
-              ) {
-                heuristicCandidate.candidate_name = String(args.candidate_name);
+              const llmName = String(args.candidate_name || "").trim();
+              const llmRole = String(args.role || "").trim();
+
+              const resolvedName =
+                llmName && llmName.toUpperCase() !== "MISSING"
+                  ? llmName
+                  : heuristicCandidate.candidate_name;
+
+              // Guard against LLM hallucinating a role when the prompt is just "Hire <Name>" with no role/position words
+              const isBareNameOnlyPrompt =
+                !imageBase64 &&
+                !heuristicCandidate.hasExplicitRole &&
+                /^(?:please\s+)?(?:hire|onboard)\s+[a-zA-Z\s.-]+$/i.test(prompt.trim());
+
+              const resolvedRole =
+                !isBareNameOnlyPrompt && llmRole && llmRole.toUpperCase() !== "MISSING"
+                  ? llmRole
+                  : heuristicCandidate.role;
+
+              const hasValidName =
+                Boolean(resolvedName) && resolvedName.toUpperCase() !== "MISSING";
+              const hasValidRole =
+                Boolean(resolvedRole) && resolvedRole.toUpperCase() !== "MISSING";
+
+              if (!hasValidName || !hasValidRole) {
+                let missingError =
+                  "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').";
+                if (hasValidName && !hasValidRole) {
+                  missingError = `Missing required field (Target Role): Could not extract a job role for ${resolvedName}. Please specify the target role (e.g., 'Hire ${resolvedName} for Senior Dev').`;
+                } else if (!hasValidName && hasValidRole) {
+                  missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${resolvedRole} position.`;
+                }
+                return NextResponse.json({ error: missingError }, { status: 400 });
               }
+
+              // Verify that the extracted role has an associated company HR policy band
+              const matchedBand = findMatchingRoleBand(resolvedRole);
+              if (!matchedBand) {
+                return NextResponse.json(
+                  {
+                    error: `Unmapped Role Policy Error: The role "${resolvedRole}" does not have an associated HR policy band. Supported HR policy roles are: Junior/Mid/Senior Software Engineer, Senior AI/ML Engineer, Staff/Principal Engineer, Senior Product Designer, Product Manager, and HR & People Operations Specialist.`,
+                  },
+                  { status: 400 }
+                );
+              }
+
+              heuristicCandidate.candidate_name = resolvedName;
               if (args.start_date) {
                 heuristicCandidate.start_date = String(args.start_date);
               }
@@ -554,24 +636,7 @@ export async function POST(req: NextRequest) {
                   args.hardware_requests.map(String);
               }
 
-              const rawRoleArg = String(args.role || heuristicCandidate.role || "").trim();
-              if (
-                !rawRoleArg ||
-                rawRoleArg.toUpperCase() === "MISSING" ||
-                !heuristicCandidate.candidate_name ||
-                heuristicCandidate.candidate_name.toUpperCase() === "MISSING"
-              ) {
-                return NextResponse.json(
-                  {
-                    error:
-                      "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary, start date, PTO, or hardware will automatically default to the role's policy standards.",
-                  },
-                  { status: 400 }
-                );
-              }
-
-              const roleArg = rawRoleArg;
-              const matchedBand = matchRoleBand(roleArg);
+              const roleArg = resolvedRole;
 
               // Default to highest salary range (matchedBand.maxSalarySAR) if salary was omitted
               let salaryArg = Number(args.salary || 0);
@@ -767,11 +832,21 @@ export async function POST(req: NextRequest) {
             break;
           }
 
+          // If all 3 tools have finished executing, stop immediately without making
+          // an extra round-trip API call to Gemini (saves API quota and latency!)
+          if (policyResult && offerLetterMarkdown && itTicketPayload) {
+            break;
+          }
+
           if (toolResponseParts.length > 0) {
             contents.push({
               role: "user",
               parts: toolResponseParts,
             });
+
+            const remainingFunctions: string[] = [];
+            if (!offerLetterMarkdown) remainingFunctions.push("generate_offer_letter");
+            if (!itTicketPayload) remainingFunctions.push("create_it_ticket");
 
             response = await ai.models.generateContent({
               model: usedModelName,
@@ -780,9 +855,15 @@ export async function POST(req: NextRequest) {
                 systemInstruction: COMPANY_POLICY_SYSTEM_PROMPT,
                 tools: AGENT_TOOLS,
                 toolConfig: {
-                  functionCallingConfig: {
-                    mode: FunctionCallingConfigMode.AUTO,
-                  },
+                  functionCallingConfig:
+                    remainingFunctions.length > 0
+                      ? {
+                          mode: FunctionCallingConfigMode.ANY,
+                          allowedFunctionNames: remainingFunctions,
+                        }
+                      : {
+                          mode: FunctionCallingConfigMode.AUTO,
+                        },
                 },
                 temperature: 0.1,
               },
@@ -924,9 +1005,7 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        agentSummary =
-          response?.text ||
-          `Successfully onboarded ${heuristicCandidate.candidate_name} as ${heuristicCandidate.role} (${heuristicCandidate.salary.toLocaleString()} SAR/month, starting ${heuristicCandidate.start_date}). Offer Letter and IT Provisioning Ticket (${itTicketPayload.ticket_id}) are ready for execution.`;
+        agentSummary = `Successfully onboarded ${heuristicCandidate.candidate_name} for ${heuristicCandidate.role} at ${heuristicCandidate.salary.toLocaleString()} SAR/month starting ${heuristicCandidate.start_date}. Both the Employment Contract and IT Ticket (${itTicketPayload.ticket_id}) have been generated.`;
 
         steps.push({
           id: "step-complete",
@@ -966,16 +1045,25 @@ export async function POST(req: NextRequest) {
     // DETERMINISTIC TOOL EXECUTION ENGINE (When no API key is set or fallback)
     // ========================================================================
     if (!heuristicCandidate.candidate_name || !heuristicCandidate.role) {
+      let missingError =
+        "Missing required fields: Could not extract both the Candidate's Name and Target Role. Please provide both (e.g., 'Hire Sarah for Senior Dev').";
+      if (heuristicCandidate.candidate_name && !heuristicCandidate.role) {
+        missingError = `Missing required field (Target Role): Could not extract a job role for ${heuristicCandidate.candidate_name}. Please specify the target role (e.g., 'Hire ${heuristicCandidate.candidate_name} for Senior Dev').`;
+      } else if (!heuristicCandidate.candidate_name && heuristicCandidate.role) {
+        missingError = `Missing required field (Candidate Name): Could not extract the candidate's name for the ${heuristicCandidate.role} position.`;
+      }
+      return NextResponse.json({ error: missingError }, { status: 400 });
+    }
+
+    const matchedBand = findMatchingRoleBand(heuristicCandidate.role);
+    if (!matchedBand) {
       return NextResponse.json(
         {
-          error:
-            "Missing required fields: Please provide at least the Candidate's Name and Target Role (e.g., 'Hire Sarah for Senior Dev'). Missing salary, start date, PTO, or hardware will automatically default to the role's policy standards.",
+          error: `Unmapped Role Policy Error: The role "${heuristicCandidate.role}" does not have an associated HR policy band. Supported HR policy roles are: Junior/Mid/Senior Software Engineer, Senior AI/ML Engineer, Staff/Principal Engineer, Senior Product Designer, Product Manager, and HR & People Operations Specialist.`,
         },
         { status: 400 }
       );
     }
-
-    const matchedBand = matchRoleBand(heuristicCandidate.role);
     if (!heuristicCandidate.hasExplicitSalary) {
       heuristicCandidate.salary = matchedBand.maxSalarySAR;
     }

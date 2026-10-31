@@ -20,6 +20,7 @@ import { AgentStepLog } from "@/lib/policies";
 interface AgentStateVisualizerProps {
   isLoading: boolean;
   activeLoadingStage: number;
+  maxLoadingStage?: number;
   steps: AgentStepLog[];
   status: "idle" | "running" | "awaiting_override" | "completed" | "rejected" | "error";
 }
@@ -54,6 +55,7 @@ const LIVE_PIPELINE_STAGES = [
 export function AgentStateVisualizer({
   isLoading,
   activeLoadingStage,
+  maxLoadingStage = 3,
   steps,
   status,
 }: AgentStateVisualizerProps) {
@@ -148,7 +150,7 @@ export function AgentStateVisualizer({
       {/* Live in-flight animation */}
       {isLoading ? (
         <div className="space-y-2.5">
-          {LIVE_PIPELINE_STAGES.map((stage, idx) => {
+          {LIVE_PIPELINE_STAGES.slice(0, maxLoadingStage + 1).map((stage, idx) => {
             const isDone = idx < activeLoadingStage;
             const isCurrent = idx === activeLoadingStage;
             return (

@@ -117,6 +117,18 @@ export const COMPANY_SALARY_BANDS: SalaryBand[] = [
     hardwareTier: "BUSINESS_STANDARD",
     securityClearance: "Level 2 — Analytics Warehouse & Product Telemetry",
   },
+  {
+    id: "hr_operations",
+    title: "HR & People Operations Specialist",
+    aliases: ["hr", "human resources", "recruiter", "talent acquisition", "hr specialist", "hr manager", "people ops", "people operations"],
+    department: "People Operations & Talent",
+    minSalarySAR: 12000,
+    maxSalarySAR: 20000,
+    standardPtoDays: 21,
+    maxPtoDaysWithoutOverride: 22,
+    hardwareTier: "BUSINESS_STANDARD",
+    securityClearance: "Level 2 — HRIS & People Operations Directory",
+  },
 ];
 
 export const COMPANY_POLICY_SUMMARY = {
@@ -142,6 +154,7 @@ Your mission is to receive messy, unstructured hiring requests (from recruiter t
    - Staff / Principal Engineer / Engineering Manager: 25,000 – 35,000 SAR (Max: 35,000 SAR)
    - Product Designer / UX Designer: 14,000 – 22,000 SAR (Max: 22,000 SAR)
    - Product Manager (PM): 18,000 – 28,000 SAR (Max: 28,000 SAR)
+   - HR & People Operations Specialist (HR / Recruiter): 12,000 – 20,000 SAR (Max: 20,000 SAR)
 2. **Annual Leave / Paid Time Off (PTO)**:
    - Standard PTO is **21 working days** per year (25 days for Staff/Principal/Manager).
    - Any request exceeding the role's standard PTO cap (e.g., 30 days PTO) is a policy violation requiring Human-in-the-Loop override.
@@ -153,61 +166,88 @@ Your mission is to receive messy, unstructured hiring requests (from recruiter t
    - Requests for company car / business class personal travel / unapproved hardware (like gaming PCs or RTX 4090 home rigs) trigger a policy violation.
 5. **IT Hardware Standards**:
    - Engineering & Design roles qualify for an Apple MacBook Pro 16" (M3 Max) or Dell XPS 15, plus a 27" 4K Display.
-   - Product/Business roles receive a MacBook Air 13" (M3) or ThinkPad X1 Carbon; requesting a top-spec M3 Max workstation for a non-engineering role is flagged as an IT upgrade notice.
+   - Product/Business/HR roles receive a MacBook Air 15" (M3) or ThinkPad X1 Carbon; requesting a top-spec M3 Max workstation for a non-engineering role is flagged as an IT upgrade notice.
 
 ### REQUIRED FIELDS & SMART DEFAULTS POLICY
 1. **Minimum Required Fields (\`candidate_name\` & \`role\`)**:
-   - The recruiter MUST provide at least the **Candidate's Name** and **Target Role** (either in text or in an uploaded image).
-   - If the candidate's name cannot be determined at all, pass \`candidate_name: "MISSING"\`. If the target role cannot be determined at all, pass \`role: "MISSING"\`.
+   - The recruiter MUST provide at least the **Candidate's Name** and **Target Role** (either in text or in an uploaded image), regardless of phrasing or word order.
+   - CRITICAL: Never guess, assume, or invent a candidate name or role if it is not present in the user's input.
+   - If the candidate's name is missing from the input, you MUST pass \`candidate_name: "MISSING"\` to \`verify_hr_policy\`.
+   - If the target role/position is missing from the input (for example, if the user only wrote "Hire Rimas Alsufyani" without specifying any role or department), you MUST pass \`role: "MISSING"\` to \`verify_hr_policy\`.
 2. **Smart Defaults When Optional Details Are Omitted**:
-   - **Salary (\`salary\`)**: If no salary is mentioned, default to the **highest salary range (maximum policy cap)** for that role (e.g., 25,000 SAR for Senior Dev, 30,000 SAR for AI/ML Engineer, 20,000 SAR for Mid-Level Dev, 15,000 SAR for Junior Dev, 35,000 SAR for Staff/Principal/Manager, 22,000 SAR for Product Designer, 28,000 SAR for Product Manager).
+   - **Salary (\`salary\`)**: If no salary is mentioned in the input, pass \`0\` to \`verify_hr_policy\` so the system automatically defaults to the **highest salary range (maximum policy cap)** for that role (e.g., 25,000 SAR for Senior Dev, 30,000 SAR for AI/ML Engineer, 20,000 SAR for Mid-Level Dev or HR Specialist, 15,000 SAR for Junior Dev, 35,000 SAR for Staff/Principal/Manager, 22,000 SAR for Product Designer, 28,000 SAR for Product Manager).
    - **Start Date (\`start_date\`)**: If no start date is mentioned, default to \`"November 15, 2026"\` (standard 2-week onboarding lead time).
    - **PTO & Work Model (\`custom_requests\`)**: If no special requests are mentioned, pass an empty array \`[]\` (automatically applies standard 21 working days PTO and Hybrid 3-day KAFD HQ schedule).
-   - **IT Hardware (\`hardware_requests\`)**: If no specific hardware is requested, default to the role's standard workstation bundle (\`['Apple MacBook Pro 16" (M3 Max)', 'Dell UltraSharp 27" 4K Monitor']\` for Engineering/AI/Design roles, or \`['Apple MacBook Air 15" (M3)', 'Dell UltraSharp 27" 4K Monitor']\` for Product/Business roles).
+   - **IT Hardware (\`hardware_requests\`)**: If no specific hardware is requested, default to the role's standard workstation bundle (\`['Apple MacBook Pro 16" (M3 Max)', 'Dell UltraSharp 27" 4K Monitor']\` for Engineering/AI/Design roles, or \`['Apple MacBook Air 15" (M3)', 'Dell UltraSharp 27" 4K Monitor']\` for Product/HR/Business roles).
 
 ### MANDATORY TOOL CALLING PROTOCOL
-- Always call \`verify_hr_policy\` FIRST with the extracted \`role\`, \`salary\` (numeric in SAR, defaulting to the role's max salary cap if omitted), \`custom_requests\`, and \`candidate_name\`.
+- Always call \`verify_hr_policy\` FIRST with the extracted \`candidate_name\`, \`role\`, \`salary\` (numeric in SAR, or \`0\` if omitted), and \`custom_requests\`.
 - After \`verify_hr_policy\` completes, if approved (or if an executive override has been granted), you MUST call both:
   1. \`generate_offer_letter\` with \`candidate_name\`, \`role\`, \`salary\`, and \`start_date\`.
   2. \`create_it_ticket\` with \`role\` and \`hardware_requests\`.
 - Provide a concise executive summary of the onboarding decision once tools finish.`;
 
-export function matchRoleBand(roleInput: string): SalaryBand {
+export function findMatchingRoleBand(roleInput: string): SalaryBand | null {
   const normalized = roleInput.toLowerCase().trim();
+  if (!normalized || normalized === "missing") {
+    return null;
+  }
 
-  // Check specific matches in priority order
+  // 1. Check exact title or whole-phrase alias matches in priority order
   for (const band of COMPANY_SALARY_BANDS) {
     if (band.title.toLowerCase() === normalized) {
       return band;
     }
     for (const alias of band.aliases) {
-      if (normalized.includes(alias)) {
+      const escapedAlias = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const aliasRegex = new RegExp(`\\b${escapedAlias}\\b`, "i");
+      if (aliasRegex.test(normalized)) {
         return band;
       }
     }
   }
 
-  // Fallback heuristics
-  if (normalized.includes("senior") || normalized.includes("sr")) {
-    return COMPANY_SALARY_BANDS.find((b) => b.id === "senior_dev")!;
-  }
-  if (normalized.includes("junior") || normalized.includes("jr")) {
-    return COMPANY_SALARY_BANDS.find((b) => b.id === "junior_dev")!;
-  }
-  if (normalized.includes("ai") || normalized.includes("ml") || normalized.includes("data")) {
+  // 2. Domain-aware keyword matching (prevents unrelated roles like "Legal Counsel" or "Senior Accountant" from matching Engineering bands)
+  const isEngineeringDomain =
+    /\b(software|dev|developer|frontend|front-end|backend|back-end|fullstack|full-stack|full\s+stack|engineer|engineering|cloud|devops|sre|qa|platform|systems|architect)\b/i.test(
+      normalized
+    );
+
+  if (/\b(ai|ml|machine\s+learning|data\s+scientist|data\s+analyst|data\s+engineer|llm|deep\s+learning)\b/i.test(normalized)) {
     return COMPANY_SALARY_BANDS.find((b) => b.id === "ai_engineer")!;
   }
-  if (normalized.includes("design") || normalized.includes("ux")) {
+  if (/\b(designer|design|ux|ui)\b/i.test(normalized)) {
     return COMPANY_SALARY_BANDS.find((b) => b.id === "product_designer")!;
   }
-  if (normalized.includes("product") || normalized.includes("pm")) {
+  if (/\b(product\s+manager|product\s+owner|product\s+lead|pm)\b/i.test(normalized)) {
     return COMPANY_SALARY_BANDS.find((b) => b.id === "product_manager")!;
   }
-  if (normalized.includes("staff") || normalized.includes("principal") || normalized.includes("manager")) {
-    return COMPANY_SALARY_BANDS.find((b) => b.id === "staff_eng")!;
+  if (/\b(hr|human\s+resources|recruiter|recruitment|talent|people\s+ops|people\s+operations)\b/i.test(normalized)) {
+    return COMPANY_SALARY_BANDS.find((b) => b.id === "hr_operations")!;
   }
 
-  return COMPANY_SALARY_BANDS.find((b) => b.id === "senior_dev")!;
+  if (isEngineeringDomain) {
+    if (/\b(staff|principal|architect|head|director|vp|manager|em)\b/i.test(normalized)) {
+      return COMPANY_SALARY_BANDS.find((b) => b.id === "staff_eng")!;
+    }
+    if (/\b(senior|sr|lead)\b/i.test(normalized)) {
+      return COMPANY_SALARY_BANDS.find((b) => b.id === "senior_dev")!;
+    }
+    if (/\b(junior|jr|associate|intern|entry)\b/i.test(normalized)) {
+      return COMPANY_SALARY_BANDS.find((b) => b.id === "junior_dev")!;
+    }
+    return COMPANY_SALARY_BANDS.find((b) => b.id === "mid_dev")!;
+  }
+
+  // No matching HR policy band exists for this role
+  return null;
+}
+
+export function matchRoleBand(roleInput: string): SalaryBand {
+  return (
+    findMatchingRoleBand(roleInput) ||
+    COMPANY_SALARY_BANDS.find((b) => b.id === "senior_dev")!
+  );
 }
 
 export interface PolicyVerificationResult {
